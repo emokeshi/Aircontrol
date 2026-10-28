@@ -14,6 +14,10 @@ public final class MultipeerServer: NSObject, @unchecked Sendable, MCSessionDele
     public private(set) var isAdvertising: Bool = false
     private var lastDockPushTime: TimeInterval = 0
 
+    public var hasConnectedPeers: Bool {
+        return !(session?.connectedPeers.isEmpty ?? true)
+    }
+
     private override init() {
         super.init()
     }

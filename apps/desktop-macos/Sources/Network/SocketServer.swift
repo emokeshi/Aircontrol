@@ -20,6 +20,15 @@ public final class SocketServer: @unchecked Sendable {
         return activeTcpConnection != nil
     }
 
+    private func onTcpClientDisconnected() {
+        MultipeerServer.shared.resumeAdvertisingIfNeeded()
+        DispatchQueue.main.async {
+            if !MultipeerServer.shared.hasConnectedPeers {
+                AppState.shared.connectedClient = nil
+            }
+        }
+    }
+
     // Lock-protected 128-entry sequence number ring for multi-path (UDP en3 + UDP en0 + TCP_NODELAY) deduplication
     private var seqLock = os_unfair_lock()
     private var seenSeqRing = [UInt16](repeating: 0, count: 128)
@@ -226,12 +235,12 @@ public final class SocketServer: @unchecked Sendable {
                 DiagnosticLogger.shared.log("TCP", "Direct TCP failed: \(err.localizedDescription)")
                 if self.activeTcpConnection === connection {
                     self.activeTcpConnection = nil
-                    MultipeerServer.shared.resumeAdvertisingIfNeeded()
+                    self.onTcpClientDisconnected()
                 }
             case .cancelled:
                 if self.activeTcpConnection === connection {
                     self.activeTcpConnection = nil
-                    MultipeerServer.shared.resumeAdvertisingIfNeeded()
+                    self.onTcpClientDisconnected()
                 }
             default:
                 break
@@ -245,7 +254,7 @@ public final class SocketServer: @unchecked Sendable {
                 guard let self = self, let connection = connection, let lenBytes = lengthData, lenBytes.count == 4, error == nil else {
                     if self?.activeTcpConnection === connection {
                         self?.activeTcpConnection = nil
-                        MultipeerServer.shared.resumeAdvertisingIfNeeded()
+                        self?.onTcpClientDisconnected()
                     }
                     connection?.cancel()
                     return

@@ -154,6 +154,24 @@ struct HostPickerSheet: View {
                     .foregroundColor(AppTheme.accent)
                 }
 
+                Section(header: Text("手动连接 IP")) {
+                    HStack {
+                        TextField("192.168.0.100", text: $manualIP)
+                            .font(.system(size: 13, design: .monospaced))
+                            .keyboardType(.decimalPad)
+                            .disableAutocorrection(true)
+
+                        Button("连接") {
+                            let trimmed = manualIP.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !trimmed.isEmpty {
+                                client.connectToIP(trimmed)
+                                dismiss()
+                            }
+                        }
+                        .font(.system(size: 13))
+                    }
+                }
+
                 Section(header: Text("唤醒设置 (MAC)")) {
                     HStack {
                         TextField("00:00:00:00:00:00", text: $manualMac)

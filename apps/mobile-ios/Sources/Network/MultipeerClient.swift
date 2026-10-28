@@ -229,12 +229,33 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
         browser.invitePeer(peerID, to: session, withContext: nil, timeout: 6)
     }
 
+    public func connectToIP(_ rawIP: String) {
+        let ip = rawIP.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard Self.isValidLanIP(ip) else { return }
+        tcpConnection?.cancel()
+        tcpConnection = nil
+        isTcpReady = false
+        if !candidateHostIPs.contains(ip) {
+            candidateHostIPs.insert(ip, at: 0)
+        }
+        connectDirectSockets(host: ip, tcpPort: 8921, udpPort: 8920)
+    }
+
     // MARK: - App Lifecycle & Silent Self-Healing
 
     private func setupLifecycleObservers() {
         NotificationCenter.default.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self = self else { return }
             DiagnosticLogger.shared.log("SYS", "App entered foreground. Interfaces: \(DiagnosticLogger.describeInterfaces())")
+            // Recreate UDP channels on foreground resume in case iOS invalidated backgrounded sockets
+            let activeIPs = self.candidateHostIPs
+            for (_, udp) in self.udpConnections {
+                udp.cancel()
+            }
+            self.udpConnections.removeAll()
+            for ip in activeIPs {
+                self.ensureUdpChannel(host: ip, port: 8920)
+            }
             if !self.isConnected {
                 self.start()
             } else {

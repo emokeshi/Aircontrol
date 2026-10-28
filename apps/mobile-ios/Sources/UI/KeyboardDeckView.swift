@@ -69,6 +69,14 @@ final class LiveKeyProxyView: UITextView, UITextViewDelegate {
         }
     }
 
+    func textViewDidEndEditing(_ textView: UITextView) {
+        DispatchQueue.main.async {
+            if AppState.shared.activePanel == .keyboard {
+                AppState.shared.activePanel = nil
+            }
+        }
+    }
+
     private func resetSentinel() {
         self.text = sentinel
         let endPos = self.endOfDocument

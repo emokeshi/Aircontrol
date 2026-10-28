@@ -34,16 +34,28 @@ public final class KeyboardSimulator {
     }
 
     public func typeUnicodeString(_ text: String) {
-        for char in text {
-            let utf16 = Array(String(char).utf16)
-            var unichars = utf16
+        let utf16 = Array(text.utf16)
+        guard !utf16.isEmpty else { return }
+
+        // Chunk up to 16 UTF-16 code units per CGEvent so multi-character IME words and pasted text never drop characters
+        let chunkSize = 16
+        var offset = 0
+        while offset < utf16.count {
+            let end = min(offset + chunkSize, utf16.count)
+            var slice = Array(utf16[offset..<end])
 
             if let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
                let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) {
-                down.keyboardSetUnicodeString(stringLength: unichars.count, unicodeString: &unichars)
-                up.keyboardSetUnicodeString(stringLength: unichars.count, unicodeString: &unichars)
+                down.flags = []
+                up.flags = []
+                down.keyboardSetUnicodeString(stringLength: slice.count, unicodeString: &slice)
+                up.keyboardSetUnicodeString(stringLength: slice.count, unicodeString: &slice)
                 down.post(tap: .cgSessionEventTap)
                 up.post(tap: .cgSessionEventTap)
+            }
+            offset = end
+            if offset < utf16.count {
+                usleep(1200)
             }
         }
     }

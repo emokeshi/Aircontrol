@@ -36,7 +36,6 @@ DEVELOPER_DIR="${DEV_DIR}" xcrun swiftc -O \
     "${MACOS_DIR}/Sources/Core/"*.swift \
     "${MACOS_DIR}/Sources/Network/"*.swift \
     "${MACOS_DIR}/Sources/App/"*.swift \
-    "${MACOS_DIR}/Sources/UI/"*.swift \
     -o "${MACOS_BIN_DIR}/AirControl"
 
 if [ -f "${MACOS_DIR}/Resources/AppIcon.icns" ]; then
