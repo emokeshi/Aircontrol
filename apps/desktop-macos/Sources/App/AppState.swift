@@ -8,9 +8,7 @@ public final class AppState: ObservableObject {
     @Published public var connectedClient: String? = nil
     @Published public var localIP: String = "127.0.0.1"
     @Published public var macAddress: String = "00:00:00:00:00:00"
-    @Published public var updatePort: UInt16 = 8923
     @Published public var isAccessibilityGranted: Bool = false
-    @Published public var showUpdateModal: Bool = false
 
     @Published public var isNaturalScroll: Bool {
         didSet {
@@ -18,8 +16,15 @@ public final class AppState: ObservableObject {
         }
     }
 
+    @Published public var launchAtLogin: Bool {
+        didSet {
+            SystemController.shared.setLaunchAtLogin(launchAtLogin)
+        }
+    }
+
     private init() {
         self.isNaturalScroll = InputSimulator.shared.isNaturalScroll
+        self.launchAtLogin = SystemController.shared.isLaunchAtLoginEnabled
         refreshLocalIP()
         refreshMacAddress()
         checkPermissions()

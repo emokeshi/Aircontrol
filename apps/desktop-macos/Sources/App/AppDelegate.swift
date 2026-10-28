@@ -53,14 +53,6 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         // Start High-Speed Local Wi-Fi Socket Server (UDP 8920 + TCP 8921)
         SocketServer.shared.start(tcpPort: 8921, udpPort: 8920)
 
-        // Start Local HTTP Update & Sideload Server (Port 8923)
-        do {
-            try UpdateServer.shared.start(port: 8923)
-            AppState.shared.updatePort = 8923
-        } catch {
-            print("[AirControl] UpdateServer notice: \(error)")
-        }
-
         AppState.shared.isRunning = true
     }
 }

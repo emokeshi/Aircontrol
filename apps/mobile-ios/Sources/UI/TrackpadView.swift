@@ -1,8 +1,6 @@
 import SwiftUI
 import UIKit
 
-// MARK: - Trackpad Client Settings (Golden Baseline 1.0x)
-
 public final class TrackpadSettings: ObservableObject {
     public static let shared = TrackpadSettings()
 
@@ -18,12 +16,15 @@ public final class TrackpadSettings: ObservableObject {
     }
 }
 
-// MARK: - Ultra-Low Latency UIKit Touch Interceptor
+// MARK: - Hardware-Coalesced UIKit Touch View
 
 final class TrackpadUIView: UIView {
     private var initialTouchPoint: CGPoint = .zero
     private var touchDownTime: TimeInterval = 0
+    private var lastTapTime: TimeInterval = 0
     private var hasMovedSignificantly: Bool = false
+    private var isTapDragging: Bool = false
+
     private let lightHaptic = UIImpactFeedbackGenerator(style: .light)
     private let mediumHaptic = UIImpactFeedbackGenerator(style: .medium)
 
@@ -40,10 +41,17 @@ final class TrackpadUIView: UIView {
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let touch = touches.first else { return }
+        let now = ProcessInfo.processInfo.systemUptime
         if event?.allTouches?.count == touches.count {
             initialTouchPoint = touch.location(in: self)
-            touchDownTime = ProcessInfo.processInfo.systemUptime
+            touchDownTime = now
             hasMovedSignificantly = false
+
+            // Double-tap and hold to drag (native macOS trackpad gesture)
+            if touches.count == 1 && (now - lastTapTime) < 0.25 {
+                isTapDragging = true
+                lightHaptic.impactOccurred()
+            }
         }
     }
 
@@ -56,14 +64,25 @@ final class TrackpadUIView: UIView {
         var count: Float = 0.0
 
         for touch in touches {
-            let curr = touch.location(in: self)
-            let prev = touch.previousLocation(in: self)
-            sumDx += Float(curr.x - prev.x)
-            sumDy += Float(curr.y - prev.y)
+            // Use coalescedTouches to capture full 120Hz/240Hz digitizer path without dropping intermediate deltas
+            if let coalesced = event?.coalescedTouches(for: touch), !coalesced.isEmpty {
+                var lastPt = touch.previousLocation(in: self)
+                for cTouch in coalesced {
+                    let pt = cTouch.location(in: self)
+                    sumDx += Float(pt.x - lastPt.x)
+                    sumDy += Float(pt.y - lastPt.y)
+                    lastPt = pt
+                }
+            } else {
+                let curr = touch.location(in: self)
+                let prev = touch.previousLocation(in: self)
+                sumDx += Float(curr.x - prev.x)
+                sumDy += Float(curr.y - prev.y)
+            }
             count += 1.0
 
-            let dist = hypot(curr.x - initialTouchPoint.x, curr.y - initialTouchPoint.y)
-            if dist > 8.0 {
+            let curr = touch.location(in: self)
+            if hypot(curr.x - initialTouchPoint.x, curr.y - initialTouchPoint.y) > 6.0 {
                 hasMovedSignificantly = true
             }
         }
@@ -71,14 +90,18 @@ final class TrackpadUIView: UIView {
         guard count > 0 else { return }
         let avgDx = sumDx / count
         let avgDy = sumDy / count
+        guard avgDx != 0 || avgDy != 0 else { return }
 
         let sens = Float(TrackpadSettings.shared.sensitivity)
         let sendDx = avgDx * sens
         let sendDy = avgDy * sens
 
-        // Direct zero-hop transmission: MCSession.send with .unreliable is non-blocking
         if fingerCount == 1 {
-            MultipeerClient.shared.sendMove(dx: sendDx, dy: sendDy)
+            if isTapDragging {
+                MultipeerClient.shared.sendDrag(dx: sendDx, dy: sendDy)
+            } else {
+                MultipeerClient.shared.sendMove(dx: sendDx, dy: sendDy)
+            }
         } else if fingerCount >= 2 {
             MultipeerClient.shared.sendScroll(dx: sendDx, dy: sendDy)
         }
@@ -88,14 +111,20 @@ final class TrackpadUIView: UIView {
         guard let allTouches = event?.allTouches else { return }
         let remainingTouches = allTouches.subtracting(touches)
 
-        // Only evaluate discrete tap when all fingers have lifted
         if remainingTouches.isEmpty {
-            let duration = ProcessInfo.processInfo.systemUptime - touchDownTime
+            if isTapDragging {
+                isTapDragging = false
+                MultipeerClient.shared.sendDragRelease()
+                return
+            }
 
-            // Discrete tap gesture (< 250ms and no significant motion)
+            let now = ProcessInfo.processInfo.systemUptime
+            let duration = now - touchDownTime
+
             if duration < 0.25 && !hasMovedSignificantly {
                 let initialCount = allTouches.count
                 if initialCount == 1 {
+                    lastTapTime = now
                     lightHaptic.impactOccurred()
                     MultipeerClient.shared.sendClick(isRight: false)
                 } else if initialCount >= 2 {
@@ -107,7 +136,10 @@ final class TrackpadUIView: UIView {
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-        MultipeerClient.shared.sendDragRelease()
+        if isTapDragging {
+            isTapDragging = false
+            MultipeerClient.shared.sendDragRelease()
+        }
     }
 }
 
@@ -121,91 +153,38 @@ struct TrackpadRepresentable: UIViewRepresentable {
     func updateUIView(_ uiView: TrackpadUIView, context: Context) {}
 }
 
-// MARK: - Trackpad Container View
+// MARK: - Expansive Minimalist Trackpad View
 
 public struct TrackpadView: View {
-    @ObservedObject var settings = TrackpadSettings.shared
     private let lightHaptic = UIImpactFeedbackGenerator(style: .light)
     private let mediumHaptic = UIImpactFeedbackGenerator(style: .medium)
 
     public init() {}
 
-    private func speedButton(label: String, val: Double) -> some View {
-        Button {
-            UISelectionFeedbackGenerator().selectionChanged()
-            settings.sensitivity = val
-        } label: {
-            Text(label)
-                .font(.system(size: 11, weight: abs(settings.sensitivity - val) < 0.05 ? .semibold : .regular))
-                .foregroundColor(abs(settings.sensitivity - val) < 0.05 ? AppTheme.accent : AppTheme.textSecondary)
-                .padding(.horizontal, 10)
-                .padding(.vertical, 4)
-                .background(abs(settings.sensitivity - val) < 0.05 ? AppTheme.accentLight : AppTheme.surfaceElevated)
-                .cornerRadius(10)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 10)
-                        .stroke(abs(settings.sensitivity - val) < 0.05 ? AppTheme.accent.opacity(0.4) : AppTheme.border, lineWidth: 1)
-                )
-        }
-        .buttonStyle(.plain)
-    }
-
     public var body: some View {
         VStack(spacing: 8) {
-            // Speed Bar
-            HStack {
-                Text("光标速度")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundColor(AppTheme.textSecondary)
-
-                HStack(spacing: 6) {
-                    speedButton(label: "0.8x", val: 0.8)
-                    speedButton(label: "1.0x", val: 1.0)
-                    speedButton(label: "1.3x", val: 1.3)
-                    speedButton(label: "1.6x", val: 1.6)
-                }
-
-                Spacer()
-
-                HStack(spacing: 4) {
-                    Circle()
-                        .fill(AppTheme.success)
-                        .frame(width: 6, height: 6)
-                    Text("触控已连接")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundColor(AppTheme.textSecondary)
-                }
-            }
-            .padding(.horizontal, 16)
-            .padding(.top, 4)
-
-            // Main Touch Surface (Apple Minimalist White Canvas)
+            // Pure White Trackpad Surface
             ZStack {
-                RoundedRectangle(cornerRadius: 20)
+                RoundedRectangle(cornerRadius: 16)
                     .fill(AppTheme.canvas)
                     .overlay(
-                        RoundedRectangle(cornerRadius: 20)
+                        RoundedRectangle(cornerRadius: 16)
                             .stroke(AppTheme.border, lineWidth: 1)
                     )
-                    .shadow(color: Color.black.opacity(0.02), radius: 8, x: 0, y: 3)
-
-                // Subtle Centered Target Indicator
-                Circle()
-                    .stroke(AppTheme.borderSubtle.opacity(0.7), lineWidth: 1.5)
-                    .frame(width: 24, height: 24)
 
                 TrackpadRepresentable()
             }
-            .padding(.horizontal, 16)
+            .padding(.horizontal, 12)
+            .padding(.top, 8)
 
-            // Physical Button Bar (左键、双击、右键)
-            HStack(spacing: 1) {
+            // Left / Right Buttons
+            HStack(spacing: 0) {
                 Button {
                     lightHaptic.impactOccurred()
                     MultipeerClient.shared.sendClick(isRight: false)
                 } label: {
                     Text("左键")
-                        .font(.system(size: 13, weight: .medium))
+                        .font(.system(size: 13, weight: .regular))
                         .foregroundColor(AppTheme.textSecondary)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .contentShape(Rectangle())
@@ -214,44 +193,28 @@ public struct TrackpadView: View {
 
                 Rectangle()
                     .fill(AppTheme.border)
-                    .frame(width: 1, height: 26)
-
-                Button {
-                    lightHaptic.impactOccurred()
-                    MultipeerClient.shared.sendClick(isRight: false, isDouble: true)
-                } label: {
-                    Text("双击")
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundColor(AppTheme.textSecondary)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-
-                Rectangle()
-                    .fill(AppTheme.border)
-                    .frame(width: 1, height: 26)
+                    .frame(width: 1, height: 22)
 
                 Button {
                     mediumHaptic.impactOccurred()
                     MultipeerClient.shared.sendClick(isRight: true)
                 } label: {
                     Text("右键")
-                        .font(.system(size: 13, weight: .medium))
+                        .font(.system(size: 13, weight: .regular))
                         .foregroundColor(AppTheme.textSecondary)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
             }
-            .frame(height: 48)
+            .frame(height: 44)
             .background(AppTheme.surface)
-            .cornerRadius(14)
+            .cornerRadius(12)
             .overlay(
-                RoundedRectangle(cornerRadius: 14)
+                RoundedRectangle(cornerRadius: 12)
                     .stroke(AppTheme.border, lineWidth: 1)
             )
-            .padding(.horizontal, 16)
+            .padding(.horizontal, 12)
             .padding(.bottom, 6)
         }
     }

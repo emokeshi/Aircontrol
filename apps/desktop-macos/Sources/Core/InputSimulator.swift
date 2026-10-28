@@ -4,24 +4,33 @@ import AppKit
 import os
 
 /// High-Performance macOS Input Engine
-/// Implements Remote Mouse's exact reverse-engineered non-linear acceleration & display-clamped event tap
+/// Uses a 120Hz frame-paced producer-consumer interpolator to eliminate Wi-Fi packet burst jitter
 public final class InputSimulator: @unchecked Sendable {
     public static let shared = InputSimulator()
 
     private var lock = os_unfair_lock()
-    private let eventSource: CGEventSource?
+    private let renderQueue = DispatchQueue(label: "com.aircontrol.input.render", qos: .userInteractive)
+    private var frameTimer: DispatchSourceTimer?
+    private var isTimerRunning: Bool = false
+    private var idleFrames: Int = 0
 
-    // In-memory cursor tracking (eliminates expensive WindowServer Mach IPC queries)
+    // In-memory cursor tracking
     private var cachedX: Double = 0.0
     private var cachedY: Double = 0.0
     private var hasValidCache: Bool = false
-    private var lastMoveTimestamp: UInt64 = 0
+    private var lastActivityTimestamp: UInt64 = 0
 
-    // Remote Mouse acceleration state
-    private var lastAccel: Float = 0.0
+    // Sub-frame interpolation accumulators (decouples network receipt from CGEventPost)
+    private var pendingDx: Double = 0.0
+    private var pendingDy: Double = 0.0
+    private var pendingScrollX: Double = 0.0
+    private var pendingScrollY: Double = 0.0
+
+    // Acceleration smoothing state
+    private var lastAccel: Float = 1.0
     private var isDragging: Bool = false
 
-    // Baseline golden speed multiplier (Remote Mouse discrete speed parameter)
+    // Baseline golden speed multiplier (1.8x default)
     public static let baseMultiplier: Float = 1.8
 
     public var sensitivity: Float {
@@ -37,8 +46,6 @@ public final class InputSimulator: @unchecked Sendable {
     }
 
     private init() {
-        self.eventSource = CGEventSource(stateID: .hidSystemState)
-
         let savedSens = UserDefaults.standard.double(forKey: "aircontrol_sensitivity")
         self.sensitivity = savedSens > 0.1 ? Float(savedSens) : 1.0
 
@@ -47,28 +54,143 @@ public final class InputSimulator: @unchecked Sendable {
         } else {
             self.isNaturalScroll = true
         }
+
+        setupFrameTimer()
     }
 
-    // MARK: - Cursor Position Synchronization
+    // MARK: - 120Hz Frame-Paced Consumer Loop
 
-    /// Synchronizes internal cached cursor coordinate with macOS WindowServer if idle >= 100ms
-    private func syncCursorPositionIfNeeded(now: UInt64) {
-        let elapsedNs = lastMoveTimestamp > 0 ? (now - lastMoveTimestamp) : 100_000_000
-        // Remote Mouse invalidates cursor cache after 100ms (0x5f5e100 ns)
-        if !hasValidCache || elapsedNs >= 100_000_000 {
+    private func setupFrameTimer() {
+        let timer = DispatchSource.makeTimerSource(flags: .strict, queue: renderQueue)
+        // 120Hz (8.333ms) cadence with 0.5ms leeway
+        timer.schedule(deadline: .now(), repeating: .nanoseconds(8_333_333), leeway: .microseconds(500))
+        timer.setEventHandler { [weak self] in
+            self?.renderTick()
+        }
+        self.frameTimer = timer
+    }
+
+    private func ensureTimerActiveLocked() {
+        idleFrames = 0
+        if !isTimerRunning {
+            isTimerRunning = true
+            frameTimer?.resume()
+        }
+    }
+
+    private func renderTick() {
+        var postMovePoint: CGPoint? = nil
+        var currentDragState: Bool = false
+        var scrollWheel1: Int32 = 0
+        var scrollWheel2: Int32 = 0
+
+        os_unfair_lock_lock(&lock)
+
+        let remDist = hypot(pendingDx, pendingDy)
+        let remScroll = hypot(pendingScrollX, pendingScrollY)
+
+        if remDist < 0.04 && remScroll < 0.2 {
+            pendingDx = 0.0
+            pendingDy = 0.0
+            pendingScrollX = 0.0
+            pendingScrollY = 0.0
+            idleFrames += 1
+            // Pause timer after ~100ms of inactivity for 0% idle CPU usage
+            if idleFrames >= 12 && isTimerRunning {
+                isTimerRunning = false
+                frameTimer?.suspend()
+            }
+            os_unfair_lock_unlock(&lock)
+            return
+        }
+
+        idleFrames = 0
+
+        // 1. Drain pointer delta smoothly (68% per 120Hz frame bridges Wi-Fi micro-dropouts)
+        if remDist >= 0.04 {
+            let drainFactor: Double = remDist < 0.5 ? 1.0 : 0.68
+            let stepX = pendingDx * drainFactor
+            let stepY = pendingDy * drainFactor
+            pendingDx -= stepX
+            pendingDy -= stepY
+
+            let rawTarget = CGPoint(x: cachedX + stepX, y: cachedY + stepY)
+            let clamped = snapToDisplayBoundsLocked(rawTarget)
+            cachedX = clamped.x
+            cachedY = clamped.y
+            postMovePoint = clamped
+            currentDragState = isDragging
+        }
+
+        // 2. Drain scroll delta smoothly
+        if remScroll >= 0.2 {
+            let scrollDrain: Double = remScroll < 1.0 ? 1.0 : 0.65
+            let stepSX = pendingScrollX * scrollDrain
+            let stepSY = pendingScrollY * scrollDrain
+            pendingScrollX -= stepSX
+            pendingScrollY -= stepSY
+
+            scrollWheel1 = Int32(stepSY.rounded())
+            scrollWheel2 = Int32(stepSX.rounded())
+        }
+
+        os_unfair_lock_unlock(&lock)
+
+        // Post at most 1 mouse event and 1 scroll event per 120Hz display frame
+        if let target = postMovePoint {
+            let eventType: CGEventType = currentDragState ? .leftMouseDragged : .mouseMoved
+            if let event = CGEvent(
+                mouseEventSource: nil,
+                mouseType: eventType,
+                mouseCursorPosition: target,
+                mouseButton: .left
+            ) {
+                event.post(tap: .cgSessionEventTap)
+            }
+        }
+
+        if scrollWheel1 != 0 || scrollWheel2 != 0 {
+            if let scrollEvent = CGEvent(
+                scrollWheelEvent2Source: nil,
+                units: .pixel,
+                wheelCount: 2,
+                wheel1: scrollWheel1,
+                wheel2: scrollWheel2,
+                wheel3: 0
+            ) {
+                scrollEvent.post(tap: .cgSessionEventTap)
+            }
+        }
+    }
+
+    // MARK: - Cursor Synchronization & Display Bounds
+
+    private func syncCursorPositionIfNeededLocked(now: UInt64) {
+        let elapsedNs = lastActivityTimestamp > 0 ? (now - lastActivityTimestamp) : 150_000_000
+        if !hasValidCache || elapsedNs >= 150_000_000 {
             if let sysLoc = CGEvent(source: nil)?.location {
                 cachedX = sysLoc.x
                 cachedY = sysLoc.y
             }
             hasValidCache = true
-            lastAccel = 0.0
+            lastAccel = 1.0
         }
+        lastActivityTimestamp = now
     }
 
-    // MARK: - Multi-Display Boundary Snapping
+    private func flushPendingMovementLocked() -> CGPoint {
+        if abs(pendingDx) > 0.01 || abs(pendingDy) > 0.01 {
+            let rawTarget = CGPoint(x: cachedX + pendingDx, y: cachedY + pendingDy)
+            let clamped = snapToDisplayBoundsLocked(rawTarget)
+            cachedX = clamped.x
+            cachedY = clamped.y
+            pendingDx = 0.0
+            pendingDy = 0.0
+        }
+        return CGPoint(x: cachedX, y: cachedY)
+    }
 
-    /// Clamps target cursor coordinates within active display bounds
-    private func snapToDisplayBounds(_ point: CGPoint) -> CGPoint {
+    private func snapToDisplayBoundsLocked(_ point: CGPoint) -> CGPoint {
         var matchedDisplay: CGDirectDisplayID = 0
         var count: UInt32 = 0
         let status = CGGetDisplaysWithPoint(point, 1, &matchedDisplay, &count)
@@ -93,76 +215,48 @@ public final class InputSimulator: @unchecked Sendable {
         return CGPoint(x: clampedX, y: clampedY)
     }
 
-    // MARK: - Cursor Movement & Dragging (Remote Mouse Reverse-Engineered Pipeline)
+    // MARK: - Producer API (Called from Network Thread)
 
     public func move(dx: Float, dy: Float) {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
-
         guard dx != 0 || dy != 0 else { return }
 
+        os_unfair_lock_lock(&lock)
         let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-        let elapsedNs = lastMoveTimestamp > 0 ? (now - lastMoveTimestamp) : 16_666_667
-        syncCursorPositionIfNeeded(now: now)
+        syncCursorPositionIfNeededLocked(now: now)
 
-        var moveDx = dx
-        var moveDy = dy
+        // Jitter-immune non-linear acceleration based on touch sample magnitude
+        let dist = hypotf(dx, dy)
+        let baseGain = Self.baseMultiplier * sensitivity
+        let rawAccel = baseGain * (1.0 + min(dist * 0.12, 2.2))
 
-        // Calculate dt in seconds
-        let rawDt = Float(elapsedNs) / 1_000_000_000.0
-        let dt: Float
-        if rawDt >= 0.002 && rawDt <= 0.05 {
-            dt = rawDt
-        } else {
-            // Clamp out-of-bounds network bursts/lags to standard 60Hz frame time
-            dt = 1.0 / 60.0
-        }
-
-        // Remote Mouse dynamic acceleration model:
-        // dist = hypot(dx, dy)
-        // factor = (dist * (1/60) / dt) / effective_speed
-        // accel = 1.0 + factor
-        let dist = hypotf(moveDx, moveDy)
-        let effectiveSpeed = max(0.5, Self.baseMultiplier * sensitivity)
-        let factor = (dist * (1.0 / 60.0) / dt) / effectiveSpeed
-        var accel = 1.0 + factor
-
-        // Remote Mouse EMA smoothing on acceleration (40ms time constant)
-        if lastAccel > 0.0 && rawDt <= 0.1 {
-            let alpha = min(1.0, dt / 0.04)
-            accel = lastAccel + alpha * (accel - lastAccel)
-        }
+        // Smooth acceleration transitions (EMA alpha = 0.35)
+        let accel = lastAccel + 0.35 * (rawAccel - lastAccel)
         lastAccel = accel
 
-        moveDx *= accel
-        moveDy *= accel
+        pendingDx += Double(dx * accel)
+        pendingDy += Double(dy * accel)
 
-        let rawTarget = CGPoint(x: cachedX + Double(moveDx), y: cachedY + Double(moveDy))
-        let target = snapToDisplayBounds(rawTarget)
+        ensureTimerActiveLocked()
+        os_unfair_lock_unlock(&lock)
+    }
 
-        cachedX = target.x
-        cachedY = target.y
-        lastMoveTimestamp = now
+    public func scroll(dx: Float, dy: Float) {
+        guard dx != 0 || dy != 0 else { return }
 
-        let eventType: CGEventType = isDragging ? .leftMouseDragged : .mouseMoved
-
-        // Direct session event tap injection (never set deltaX/deltaY to prevent double-accumulation stutter)
-        if let event = CGEvent(
-            mouseEventSource: nil,
-            mouseType: eventType,
-            mouseCursorPosition: target,
-            mouseButton: .left
-        ) {
-            event.post(tap: .cgSessionEventTap)
-        }
+        let scrollMultiplier: Float = isNaturalScroll ? 1.0 : -1.0
+        os_unfair_lock_lock(&lock)
+        pendingScrollX += Double(dx * scrollMultiplier * 2.2)
+        pendingScrollY += Double(dy * scrollMultiplier * 2.2)
+        ensureTimerActiveLocked()
+        os_unfair_lock_unlock(&lock)
     }
 
     public func setDragging(_ dragging: Bool) {
         os_unfair_lock_lock(&lock)
         let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-        syncCursorPositionIfNeeded(now: now)
+        syncCursorPositionIfNeededLocked(now: now)
+        let targetPoint = flushPendingMovementLocked()
         isDragging = dragging
-        let targetPoint = CGPoint(x: cachedX, y: cachedY)
         os_unfair_lock_unlock(&lock)
 
         let eventType: CGEventType = dragging ? .leftMouseDown : .leftMouseUp
@@ -176,13 +270,11 @@ public final class InputSimulator: @unchecked Sendable {
         }
     }
 
-    // MARK: - Discrete Clicks (Session Event Tap with Cursor Sync)
-
     public func leftClick() {
         os_unfair_lock_lock(&lock)
         let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-        syncCursorPositionIfNeeded(now: now)
-        let targetPoint = CGPoint(x: cachedX, y: cachedY)
+        syncCursorPositionIfNeededLocked(now: now)
+        let targetPoint = flushPendingMovementLocked()
         os_unfair_lock_unlock(&lock)
 
         let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: targetPoint, mouseButton: .left)
@@ -194,8 +286,8 @@ public final class InputSimulator: @unchecked Sendable {
     public func doubleClick() {
         os_unfair_lock_lock(&lock)
         let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-        syncCursorPositionIfNeeded(now: now)
-        let targetPoint = CGPoint(x: cachedX, y: cachedY)
+        syncCursorPositionIfNeededLocked(now: now)
+        let targetPoint = flushPendingMovementLocked()
         os_unfair_lock_unlock(&lock)
 
         let down1 = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: targetPoint, mouseButton: .left)
@@ -214,31 +306,13 @@ public final class InputSimulator: @unchecked Sendable {
     public func rightClick() {
         os_unfair_lock_lock(&lock)
         let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-        syncCursorPositionIfNeeded(now: now)
-        let targetPoint = CGPoint(x: cachedX, y: cachedY)
+        syncCursorPositionIfNeededLocked(now: now)
+        let targetPoint = flushPendingMovementLocked()
         os_unfair_lock_unlock(&lock)
 
         let down = CGEvent(mouseEventSource: nil, mouseType: .rightMouseDown, mouseCursorPosition: targetPoint, mouseButton: .right)
         let up = CGEvent(mouseEventSource: nil, mouseType: .rightMouseUp, mouseCursorPosition: targetPoint, mouseButton: .right)
         down?.post(tap: .cgSessionEventTap)
         up?.post(tap: .cgSessionEventTap)
-    }
-
-    // MARK: - Smooth Pixel Scrolling (Session Event Tap)
-
-    public func scroll(dx: Float, dy: Float) {
-        let scrollMultiplier: Float = isNaturalScroll ? 1.0 : -1.0
-        let wheel1 = Int32(dy * scrollMultiplier * 2.0)
-        let wheel2 = Int32(dx * scrollMultiplier * 2.0)
-
-        let scrollEvent = CGEvent(
-            scrollWheelEvent2Source: nil,
-            units: .pixel,
-            wheelCount: 2,
-            wheel1: wheel1,
-            wheel2: wheel2,
-            wheel3: 0
-        )
-        scrollEvent?.post(tap: .cgSessionEventTap)
     }
 }

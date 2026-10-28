@@ -8,13 +8,12 @@ public final class SocketServer: @unchecked Sendable {
     private var tcpListener: NWListener?
     private var udpListener: NWListener?
     private var netService: NetService?
+    private var activeTcpConnection: NWConnection?
     private let queue = DispatchQueue(label: "com.aircontrol.socket.server", qos: .userInteractive)
 
     public private(set) var isRunning: Bool = false
     public var tcpPort: UInt16 = 8921
     public var udpPort: UInt16 = 8920
-
-    private var lastSequenceNumber: UInt16 = 0
 
     private init() {}
 
@@ -27,11 +26,18 @@ public final class SocketServer: @unchecked Sendable {
         startTcp(port: tcpPort)
         publishBonjour(port: tcpPort)
         isRunning = true
+
+        SystemController.shared.startWorkspaceMonitoring { [weak self] in
+            self?.broadcastDockApps()
+            MultipeerServer.shared.broadcastDockApps()
+        }
     }
 
     public func stop() {
         netService?.stop()
         netService = nil
+        activeTcpConnection?.cancel()
+        activeTcpConnection = nil
         tcpListener?.cancel()
         tcpListener = nil
         udpListener?.cancel()
@@ -39,19 +45,20 @@ public final class SocketServer: @unchecked Sendable {
         isRunning = false
     }
 
-    // MARK: - Bonjour Advertisement
-
     private func publishBonjour(port: UInt16) {
         let hostName = Host.current().localizedName ?? "Mac"
-        netService = NetService(domain: "", type: "_aircontrol._tcp.", name: "AirControl [\(hostName)]", port: Int32(port))
+        netService = NetService(domain: "", type: "_aircontrol._tcp.", name: hostName, port: Int32(port))
         netService?.publish()
     }
 
-    // MARK: - UDP Motion Listener (16-Byte Datagrams)
+    // MARK: - WMM High-Priority UDP Motion Listener (16-Byte Datagrams)
 
     private func startUdp(port: UInt16) {
         let params = NWParameters.udp
         params.allowLocalEndpointReuse = true
+        // 802.11e WMM Voice/Video QoS priority (bypasses Wi-Fi frame aggregation buffer)
+        params.serviceClass = .interactiveVideo
+
         guard let listener = try? NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!) else { return }
 
         listener.newConnectionHandler = { [weak self] connection in
@@ -64,12 +71,12 @@ public final class SocketServer: @unchecked Sendable {
     private func handleUdpConnection(_ connection: NWConnection) {
         connection.start(queue: queue)
         func receiveNext() {
-            connection.receiveMessage { [weak self, weak connection] content, _, isComplete, error in
+            connection.receiveMessage { [weak self, weak connection] content, _, _, error in
                 guard let self = self, let data = content, error == nil else {
                     connection?.cancel()
                     return
                 }
-                if data.count == 16 && data[0] == 0xA8 {
+                if data.count >= 16 && data[0] == 0xA8 {
                     self.processMotionPacket(data)
                 }
                 receiveNext()
@@ -78,7 +85,7 @@ public final class SocketServer: @unchecked Sendable {
         receiveNext()
     }
 
-    private func processMotionPacket(_ data: Data) {
+    public func processMotionPacket(_ data: Data) {
         data.withUnsafeBytes { raw in
             guard let ptr = raw.baseAddress else { return }
 
@@ -92,14 +99,14 @@ public final class SocketServer: @unchecked Sendable {
             let flags = UInt16(bigEndian: rawFlags)
 
             switch eventType {
-            case 0x01: // Pointer Move
+            case 0x01:
                 InputSimulator.shared.move(dx: dx, dy: dy)
-            case 0x02: // Scroll
+            case 0x02:
                 InputSimulator.shared.scroll(dx: dx, dy: dy)
-            case 0x03: // Drag
+            case 0x03:
                 InputSimulator.shared.setDragging(true)
                 InputSimulator.shared.move(dx: dx, dy: dy)
-            case 0x04: // Click
+            case 0x04:
                 if flags & 0x08 != 0 {
                     InputSimulator.shared.doubleClick()
                 } else if flags & 0x02 != 0 {
@@ -107,7 +114,7 @@ public final class SocketServer: @unchecked Sendable {
                 } else {
                     InputSimulator.shared.leftClick()
                 }
-            case 0x05: // Drag release
+            case 0x05:
                 InputSimulator.shared.setDragging(false)
             default:
                 break
@@ -115,11 +122,18 @@ public final class SocketServer: @unchecked Sendable {
         }
     }
 
-    // MARK: - TCP Control Listener
+    // MARK: - Low-Latency TCP_NODELAY Control Listener
 
     private func startTcp(port: UInt16) {
-        let params = NWParameters.tcp
+        let tcpOptions = NWProtocolTCP.Options()
+        tcpOptions.noDelay = true
+        tcpOptions.enableKeepalive = true
+        tcpOptions.keepaliveIdle = 2
+
+        let params = NWParameters(tls: nil, tcp: tcpOptions)
         params.allowLocalEndpointReuse = true
+        params.serviceClass = .interactiveVideo
+
         guard let listener = try? NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!) else { return }
 
         listener.newConnectionHandler = { [weak self] connection in
@@ -130,10 +144,11 @@ public final class SocketServer: @unchecked Sendable {
     }
 
     private func handleTcpConnection(_ connection: NWConnection) {
+        activeTcpConnection = connection
         connection.start(queue: queue)
 
         func readMessage() {
-            connection.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self, weak connection] lengthData, _, isComplete, error in
+            connection.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self, weak connection] lengthData, _, _, error in
                 guard let self = self, let connection = connection, let lenBytes = lengthData, lenBytes.count == 4, error == nil else {
                     connection?.cancel()
                     return
@@ -173,12 +188,33 @@ public final class SocketServer: @unchecked Sendable {
         connection.send(content: packet, completion: .contentProcessed { _ in })
     }
 
+    public func broadcastDockApps() {
+        guard let conn = activeTcpConnection else { return }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            let apps = SystemController.shared.getRunningApplications()
+            let appDicts: [[String: Any]] = apps.map { app in
+                var d: [String: Any] = [
+                    "bundle_id": app.bundleId,
+                    "name": app.name,
+                    "is_active": app.isActive
+                ]
+                if let icon = app.iconBase64 {
+                    d["icon_base64"] = icon
+                }
+                return d
+            }
+            self.sendTcpJson(["type": "dock_list", "apps": appDicts], connection: conn)
+        }
+    }
+
     private func processTcpMessage(_ json: [String: Any], type: String, connection: NWConnection) {
         switch type {
-        case "client_hello":
-            let clientName = json["client_name"] as? String ?? "iOS Client"
-            DispatchQueue.main.async {
-                AppState.shared.connectedClient = clientName
+        case "client_hello", "host_query":
+            if let clientName = json["client_name"] as? String {
+                DispatchQueue.main.async {
+                    AppState.shared.connectedClient = clientName
+                }
             }
             sendTcpJson([
                 "type": "host_ack",
@@ -188,9 +224,11 @@ public final class SocketServer: @unchecked Sendable {
                 "udp_port": Int(udpPort),
                 "local_ip": AppState.shared.localIP,
                 "mac_address": AppState.shared.macAddress,
-                "power_state": "awake",
-                "update_port": Int(AppState.shared.updatePort)
+                "volume": Double(SystemController.shared.getMasterVolume()),
+                "natural_scroll": InputSimulator.shared.isNaturalScroll,
+                "power_state": "awake"
             ], connection: connection)
+            broadcastDockApps()
 
         case "ping":
             let clientTime = json["client_time"] ?? json["timestamp"] ?? 0.0
@@ -241,27 +279,27 @@ public final class SocketServer: @unchecked Sendable {
                 }
             }
 
-        case "dock_get":
-            DispatchQueue.global(qos: .userInitiated).async {
-                let apps = SystemController.shared.getRunningApplications()
-                let appDicts: [[String: Any]] = apps.map { app in
-                    var d: [String: Any] = [
-                        "bundle_id": app.bundleId,
-                        "name": app.name,
-                        "is_active": app.isActive
-                    ]
-                    if let icon = app.iconBase64 {
-                        d["icon_base64"] = icon
-                    }
-                    return d
+        case "settings_update":
+            if let natural = json["natural_scroll"] as? Bool {
+                DispatchQueue.main.async {
+                    AppState.shared.isNaturalScroll = natural
                 }
-                self.sendTcpJson(["type": "dock_list", "apps": appDicts], connection: connection)
             }
+
+        case "dock_get":
+            broadcastDockApps()
 
         case "app_activate":
             if let bundleId = json["bundle_id"] as? String {
                 DispatchQueue.main.async {
                     SystemController.shared.activateApplication(bundleId: bundleId)
+                }
+            }
+
+        case "app_terminate":
+            if let bundleId = json["bundle_id"] as? String {
+                DispatchQueue.main.async {
+                    SystemController.shared.terminateApplication(bundleId: bundleId)
                 }
             }
 

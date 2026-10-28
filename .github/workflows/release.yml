@@ -39,7 +39,6 @@ jobs:
           files: |
             dist/AirControl-macOS.zip
             dist/AirControl.ipa
-            source.json
           draft: false
           prerelease: false
           generate_release_notes: true

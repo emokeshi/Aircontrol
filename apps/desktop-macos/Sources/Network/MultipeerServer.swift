@@ -39,28 +39,27 @@ public final class MultipeerServer: NSObject, @unchecked Sendable, MCSessionDele
         isRunning = false
     }
 
-    // MARK: - MCNearbyServiceAdvertiserDelegate
-
     public func advertiser(_ advertiser: MCNearbyServiceAdvertiser, didReceiveInvitationFromPeer peerID: MCPeerID, withContext context: Data?, invitationHandler: @escaping (Bool, MCSession?) -> Void) {
         invitationHandler(true, session)
     }
 
-    public func advertiser(_ advertiser: MCNearbyServiceAdvertiser, didNotStartAdvertisingPeer error: Error) {
-        print("[MultipeerServer] Failed to advertise: \(error)")
-    }
-
-    // MARK: - MCSessionDelegate
+    public func advertiser(_ advertiser: MCNearbyServiceAdvertiser, didNotStartAdvertisingPeer error: Error) {}
 
     public func session(_ session: MCSession, peer peerID: MCPeerID, didChange state: MCSessionState) {
         DispatchQueue.main.async {
             switch state {
             case .connected:
+                // Stop advertising while connected to prevent awdl0 background channel scanning jitter
+                self.advertiser?.stopAdvertisingPeer()
                 AppState.shared.connectedClient = peerID.displayName
                 self.sendHostAck(to: peerID)
                 self.pushRunningDockApps(to: peerID)
             case .notConnected:
-                if AppState.shared.connectedClient == peerID.displayName {
-                    AppState.shared.connectedClient = nil
+                if self.session?.connectedPeers.isEmpty ?? true {
+                    self.advertiser?.startAdvertisingPeer()
+                    if AppState.shared.connectedClient == peerID.displayName {
+                        AppState.shared.connectedClient = nil
+                    }
                 }
             case .connecting:
                 break
@@ -71,60 +70,20 @@ public final class MultipeerServer: NSObject, @unchecked Sendable, MCSessionDele
     }
 
     public func session(_ session: MCSession, didReceive data: Data, fromPeer peerID: MCPeerID) {
-        // FAST PATH: Direct synchronous processing for zero queue-hop latency
-        if data.count == 16, data[0] == 0xA8 {
-            processMotionPacket(data)
+        if data.count >= 16, data[0] == 0xA8 {
+            SocketServer.shared.processMotionPacket(data)
             return
         }
 
-        // CONTROL PATH: JSON command
         if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
            let type = json["type"] as? String {
             processJsonMessage(json, type: type, from: peerID)
         }
     }
 
-    private func processMotionPacket(_ data: Data) {
-        data.withUnsafeBytes { raw in
-            guard let ptr = raw.baseAddress else { return }
-
-            let eventType = ptr.load(fromByteOffset: 1, as: UInt8.self)
-            let rawDx = ptr.load(fromByteOffset: 4, as: UInt32.self)
-            let rawDy = ptr.load(fromByteOffset: 8, as: UInt32.self)
-            let dx = Float(bitPattern: UInt32(bigEndian: rawDx))
-            let dy = Float(bitPattern: UInt32(bigEndian: rawDy))
-
-            let rawFlags = ptr.load(fromByteOffset: 14, as: UInt16.self)
-            let flags = UInt16(bigEndian: rawFlags)
-
-            switch eventType {
-            case 0x01: // Pointer Move
-                InputSimulator.shared.move(dx: dx, dy: dy)
-            case 0x02: // Scroll
-                InputSimulator.shared.scroll(dx: dx, dy: dy)
-            case 0x03: // Drag
-                InputSimulator.shared.setDragging(true)
-                InputSimulator.shared.move(dx: dx, dy: dy)
-            case 0x04: // Click
-                if flags & 0x08 != 0 {
-                    InputSimulator.shared.doubleClick()
-                } else if flags & 0x02 != 0 {
-                    InputSimulator.shared.rightClick()
-                } else {
-                    InputSimulator.shared.leftClick()
-                }
-            case 0x05: // Drag release
-                InputSimulator.shared.setDragging(false)
-            default:
-                break
-            }
-        }
-    }
-
     private func processJsonMessage(_ json: [String: Any], type: String, from peerID: MCPeerID) {
         switch type {
         case "ping":
-            // Echo back client timestamp for true zero clock-drift RTT measurement
             let clientTime = json["client_time"] ?? json["timestamp"] ?? 0.0
             sendJson(["type": "pong", "client_time": clientTime], to: peerID)
 
@@ -170,6 +129,13 @@ public final class MultipeerServer: NSObject, @unchecked Sendable, MCSessionDele
                     SystemController.shared.mediaPrevious()
                 default:
                     break
+                }
+            }
+
+        case "settings_update":
+            if let natural = json["natural_scroll"] as? Bool {
+                DispatchQueue.main.async {
+                    AppState.shared.isNaturalScroll = natural
                 }
             }
 
@@ -224,12 +190,21 @@ public final class MultipeerServer: NSObject, @unchecked Sendable, MCSessionDele
             "host_name": Host.current().localizedName ?? "Mac",
             "os": "macOS",
             "ver": "2.0",
+            "udp_port": Int(SocketServer.shared.udpPort),
             "local_ip": AppState.shared.localIP,
             "mac_address": AppState.shared.macAddress,
-            "power_state": "awake",
-            "update_port": Int(AppState.shared.updatePort)
+            "volume": Double(SystemController.shared.getMasterVolume()),
+            "natural_scroll": InputSimulator.shared.isNaturalScroll,
+            "power_state": "awake"
         ]
         sendJson(ack, to: peerID)
+    }
+
+    public func broadcastDockApps() {
+        guard let peers = session?.connectedPeers, !peers.isEmpty else { return }
+        for peer in peers {
+            pushRunningDockApps(to: peer)
+        }
     }
 
     private func pushRunningDockApps(to peerID: MCPeerID) {

@@ -2,12 +2,59 @@ import Foundation
 import AppKit
 import CoreAudio
 import AudioToolbox
+import ServiceManagement
 import Darwin
 
-public final class SystemController {
+public final class SystemController: @unchecked Sendable {
     public static let shared = SystemController()
 
+    private var iconCache: [String: String] = [:]
+    private let cacheLock = NSLock()
+    private var workspaceObserversSetup = false
+
     private init() {}
+
+    // MARK: - Launch at Login (Zero-Maintenance Host)
+
+    public var isLaunchAtLoginEnabled: Bool {
+        if #available(macOS 13.0, *) {
+            return SMAppService.mainApp.status == .enabled
+        }
+        return false
+    }
+
+    public func setLaunchAtLogin(_ enabled: Bool) {
+        if #available(macOS 13.0, *) {
+            do {
+                if enabled {
+                    try SMAppService.mainApp.register()
+                } else {
+                    try SMAppService.mainApp.unregister()
+                }
+            } catch {
+                print("[SystemController] LaunchAtLogin notice: \(error)")
+            }
+        }
+    }
+
+    // MARK: - Real-Time Workspace App Change Observer
+
+    public func startWorkspaceMonitoring(onUpdate: @escaping () -> Void) {
+        guard !workspaceObserversSetup else { return }
+        workspaceObserversSetup = true
+
+        let nc = NSWorkspace.shared.notificationCenter
+        let notifications: [NSNotification.Name] = [
+            NSWorkspace.didActivateApplicationNotification,
+            NSWorkspace.didLaunchApplicationNotification,
+            NSWorkspace.didTerminateApplicationNotification
+        ]
+        for name in notifications {
+            nc.addObserver(forName: name, object: nil, queue: .main) { _ in
+                onUpdate()
+            }
+        }
+    }
 
     // MARK: - CoreAudio Volume Control
 
@@ -187,13 +234,21 @@ public final class SystemController {
                 guard let bundleId = app.bundleIdentifier,
                       let name = app.localizedName else { return nil }
 
-                var iconString: String? = nil
-                if let icon = app.icon {
-                    icon.size = NSSize(width: 64, height: 64)
-                    if let tiffData = icon.tiffRepresentation,
+                cacheLock.lock()
+                var iconString = iconCache[bundleId]
+                cacheLock.unlock()
+
+                if iconString == nil, let icon = app.icon {
+                    let copy = (icon.copy() as? NSImage) ?? icon
+                    copy.size = NSSize(width: 56, height: 56)
+                    if let tiffData = copy.tiffRepresentation,
                        let bitmap = NSBitmapImageRep(data: tiffData),
                        let pngData = bitmap.representation(using: .png, properties: [:]) {
-                        iconString = pngData.base64EncodedString()
+                        let encoded = pngData.base64EncodedString()
+                        iconString = encoded
+                        cacheLock.lock()
+                        iconCache[bundleId] = encoded
+                        cacheLock.unlock()
                     }
                 }
 

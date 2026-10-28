@@ -29,18 +29,18 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
     private var session: MCSession!
     private var browser: MCNearbyServiceBrowser!
 
-    // Fallback Bonjour & Sockets
     private var netBrowser: NetServiceBrowser?
     private var resolvingServices: [NetService] = []
     private var tcpConnection: NWConnection?
     private var udpConnection: NWConnection?
+    private let socketQueue = DispatchQueue(label: "com.aircontrol.client.socket", qos: .userInteractive)
 
     @Published public var isConnected: Bool = false
-    @Published public var connectedHostName: String = ""
-    @Published public var hostIP: String = ""
-    @Published public var hostUpdatePort: Int = 8923
+    @Published public var connectedHostName: String = UserDefaults.standard.string(forKey: "aircontrol_saved_host_name") ?? ""
+    @Published public var hostIP: String = UserDefaults.standard.string(forKey: "aircontrol_saved_host_ip") ?? ""
     @Published public var targetMacAddress: String = UserDefaults.standard.string(forKey: "aircontrol_saved_mac") ?? ""
-    @Published public var powerState: String = "unknown"
+    @Published public var hostVolume: Float = 0.5
+    @Published public var isNaturalScroll: Bool = true
     @Published public var latencyMs: Int = 0
     @Published public var dockApps: [RemoteApp] = []
     @Published public var discoveredHosts: [MCPeerID] = []
@@ -48,6 +48,7 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
 
     private var connectedPeer: MCPeerID?
     private var pingTimer: Timer?
+    private var reconnectTimer: Timer?
     private var sequenceNumber: UInt16 = 0
 
     private override init() {
@@ -69,35 +70,64 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
         if browser == nil || session == nil {
             setupPeer()
         }
-        browser.stopBrowsingForPeers()
-        netBrowser?.stop()
 
+        isSearching = !isConnected
+
+        // 1. 0ms Instant Fast-Path: Immediately dial last known Mac IP without waiting for Bonjour scan
+        let savedIP = hostIP.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !savedIP.isEmpty && !isConnected {
+            connectDirectSockets(host: savedIP, tcpPort: 8921, udpPort: 8920)
+        }
+
+        // 2. If Mac is sleeping, silently send a background Wake-on-LAN packet so it wakes automatically
+        let savedMac = targetMacAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !savedMac.isEmpty && !isConnected {
+            WakeOnLAN.wake(mac: savedMac, completion: nil)
+        }
+
+        // 3. Discovery fallback (automatically stops as soon as connected to prevent Wi-Fi scan stutter)
+        if !isConnected {
+            browser.startBrowsingForPeers()
+            netBrowser?.stop()
+            netBrowser = NetServiceBrowser()
+            netBrowser?.delegate = self
+            netBrowser?.searchForServices(ofType: "_aircontrol._tcp.", inDomain: "")
+        }
+
+        startReconnectMonitor()
+    }
+
+    /// Stops background radio scanning once connected so Wi-Fi chip never hops off the main channel
+    private func pauseBackgroundScanning() {
+        browser?.stopBrowsingForPeers()
+        netBrowser?.stop()
+        resolvingServices.removeAll()
+        isSearching = false
+    }
+
+    public func rescan() {
         discoveredHosts.removeAll()
         isSearching = true
-
-        // 1. Apple Native Multipeer Connectivity (AWDL + Wi-Fi Direct + BLE)
-        browser.startBrowsingForPeers()
-
-        // 2. High-Speed Local Wi-Fi Bonjour Fallback
+        browser?.startBrowsingForPeers()
+        netBrowser?.stop()
         netBrowser = NetServiceBrowser()
         netBrowser?.delegate = self
         netBrowser?.searchForServices(ofType: "_aircontrol._tcp.", inDomain: "")
     }
 
     public func stop() {
-        browser?.stopBrowsingForPeers()
+        pauseBackgroundScanning()
         session?.disconnect()
-        netBrowser?.stop()
-        netBrowser = nil
         tcpConnection?.cancel()
         tcpConnection = nil
         udpConnection?.cancel()
         udpConnection = nil
         stopPingLoop()
+        reconnectTimer?.invalidate()
+        reconnectTimer = nil
 
         DispatchQueue.main.async {
             self.isConnected = false
-            self.connectedHostName = ""
             self.latencyMs = 0
             self.connectedPeer = nil
             self.isSearching = false
@@ -109,10 +139,10 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
             session.disconnect()
         }
         connectedPeer = peerID
-        browser.invitePeer(peerID, to: session, withContext: nil, timeout: 8)
+        browser.invitePeer(peerID, to: session, withContext: nil, timeout: 6)
     }
 
-    // MARK: - App Lifecycle Observers (Foreground Resume)
+    // MARK: - App Lifecycle & Silent Self-Healing
 
     private func setupLifecycleObservers() {
         NotificationCenter.default.addObserver(forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main) { [weak self] _ in
@@ -131,6 +161,17 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
         }
     }
 
+    private func startReconnectMonitor() {
+        reconnectTimer?.invalidate()
+        reconnectTimer = Timer.scheduledTimer(withTimeInterval: 2.5, repeats: true) { [weak self] _ in
+            guard let self = self, !self.isConnected else { return }
+            let ip = self.hostIP.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !ip.isEmpty && self.tcpConnection == nil {
+                self.connectDirectSockets(host: ip, tcpPort: 8921, udpPort: 8920)
+            }
+        }
+    }
+
     // MARK: - MCNearbyServiceBrowserDelegate
 
     public func browser(_ browser: MCNearbyServiceBrowser, foundPeer peerID: MCPeerID, withDiscoveryInfo info: [String: String]?) {
@@ -138,7 +179,7 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
             if !self.discoveredHosts.contains(peerID) {
                 self.discoveredHosts.append(peerID)
             }
-            if self.connectedPeer == nil {
+            if !self.isConnected && self.connectedPeer == nil {
                 self.connect(to: peerID)
             }
         }
@@ -159,7 +200,8 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
                 self.isConnected = true
                 self.connectedPeer = peerID
                 self.connectedHostName = peerID.displayName
-                self.isSearching = false
+                UserDefaults.standard.set(peerID.displayName, forKey: "aircontrol_saved_host_name")
+                self.pauseBackgroundScanning()
                 self.sendHostQuery()
                 self.startPingLoop()
                 self.requestDock()
@@ -168,7 +210,6 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
                     self.connectedPeer = nil
                     if self.tcpConnection == nil {
                         self.isConnected = false
-                        self.connectedHostName = ""
                         self.latencyMs = 0
                         self.stopPingLoop()
                         self.start()
@@ -189,12 +230,12 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
         }
     }
 
-    // MARK: - Bonjour & Socket Fallback Engine
+    // MARK: - Direct WMM UDP + TCP_NODELAY Socket Engine
 
     public func netServiceBrowser(_ browser: NetServiceBrowser, didFind service: NetService, moreComing: Bool) {
         service.delegate = self
         resolvingServices.append(service)
-        service.resolve(withTimeout: 4.0)
+        service.resolve(withTimeout: 3.0)
     }
 
     public func netServiceDidResolveAddress(_ sender: NetService) {
@@ -211,46 +252,79 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
                 inet_ntop(AF_INET, &sinAddr, &hostBuffer, socklen_t(hostBuffer.count))
                 let ipStr = String(cString: hostBuffer)
 
-                connectSocketFallback(host: ipStr, port: UInt16(sender.port))
-                break
+                if ipStr != "127.0.0.1" && !ipStr.isEmpty {
+                    connectDirectSockets(host: ipStr, tcpPort: UInt16(sender.port), udpPort: 8920)
+                    break
+                }
             }
         }
     }
 
-    private func connectSocketFallback(host: String, port: UInt16) {
-        guard !isConnected else { return }
-        self.hostIP = host
+    private func setupUdpChannel(host: String, port: UInt16 = 8920) {
+        udpConnection?.cancel()
+        let udpParams = NWParameters.udp
+        // 802.11e WMM Voice/Video QoS tag to bypass Wi-Fi router packet aggregation jitter
+        udpParams.serviceClass = .interactiveVideo
 
-        let tcpEndpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!)
-        let tcp = NWConnection(to: tcpEndpoint, using: .tcp)
+        let udpEndpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!)
+        let udp = NWConnection(to: udpEndpoint, using: udpParams)
+        udp.start(queue: socketQueue)
+        self.udpConnection = udp
+    }
+
+    private func connectDirectSockets(host: String, tcpPort: UInt16 = 8921, udpPort: UInt16 = 8920) {
+        self.hostIP = host
+        UserDefaults.standard.set(host, forKey: "aircontrol_saved_host_ip")
+
+        setupUdpChannel(host: host, port: udpPort)
+
+        guard tcpConnection == nil else { return }
+
+        let tcpOptions = NWProtocolTCP.Options()
+        tcpOptions.noDelay = true
+        tcpOptions.connectionTimeout = 3
+        let tcpParams = NWParameters(tls: nil, tcp: tcpOptions)
+        tcpParams.serviceClass = .interactiveVideo
+
+        let tcpEndpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: tcpPort)!)
+        let tcp = NWConnection(to: tcpEndpoint, using: tcpParams)
         tcp.stateUpdateHandler = { [weak self] state in
             guard let self = self else { return }
-            if case .ready = state {
+            switch state {
+            case .ready:
                 DispatchQueue.main.async {
-                    if !self.isConnected {
-                        self.isConnected = true
-                        self.isSearching = false
-                        self.startPingLoop()
-                        self.sendJson(["type": "client_hello", "client_name": UIDevice.current.name])
-                        self.requestDock()
-                    }
+                    self.isConnected = true
+                    self.pauseBackgroundScanning()
+                    self.startPingLoop()
+                    self.sendJson(["type": "client_hello", "client_name": UIDevice.current.name])
+                    self.requestDock()
                 }
                 self.receiveTcpStream(from: tcp)
+            case .failed, .cancelled:
+                DispatchQueue.main.async {
+                    self.tcpConnection = nil
+                    if self.connectedPeer == nil {
+                        self.isConnected = false
+                    }
+                }
+            default:
+                break
             }
         }
-        tcp.start(queue: .main)
+        tcp.start(queue: socketQueue)
         self.tcpConnection = tcp
-
-        let udpEndpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: 8920)!)
-        let udp = NWConnection(to: udpEndpoint, using: .udp)
-        udp.start(queue: .main)
-        self.udpConnection = udp
     }
 
     private func receiveTcpStream(from connection: NWConnection) {
         func readNext() {
             connection.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self, weak connection] lenData, _, _, error in
                 guard let self = self, let connection = connection, let lenBytes = lenData, lenBytes.count == 4, error == nil else {
+                    DispatchQueue.main.async {
+                        self?.tcpConnection = nil
+                        if self?.connectedPeer == nil {
+                            self?.isConnected = false
+                        }
+                    }
                     return
                 }
                 let payloadLen = Int(lenBytes.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian })
@@ -279,18 +353,24 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
                     self.connectedHostName = hostName
                     UserDefaults.standard.set(hostName, forKey: "aircontrol_saved_host_name")
                 }
-                if let ip = json["local_ip"] as? String {
-                    self.hostIP = ip
-                }
-                if let port = json["update_port"] as? Int {
-                    self.hostUpdatePort = port
+                if let ip = json["local_ip"] as? String, !ip.isEmpty, ip != "127.0.0.1" {
+                    let udpPort = UInt16(json["udp_port"] as? Int ?? 8920)
+                    if self.hostIP != ip || self.udpConnection == nil {
+                        self.hostIP = ip
+                        UserDefaults.standard.set(ip, forKey: "aircontrol_saved_host_ip")
+                        // Upgrade motion channel immediately to direct WMM UDP to bypass awdl0
+                        self.setupUdpChannel(host: ip, port: udpPort)
+                    }
                 }
                 if let mac = json["mac_address"] as? String, !mac.isEmpty {
                     self.targetMacAddress = mac
                     UserDefaults.standard.set(mac, forKey: "aircontrol_saved_mac")
                 }
-                if let pwr = json["power_state"] as? String {
-                    self.powerState = pwr
+                if let vol = json["volume"] as? Double {
+                    self.hostVolume = Float(vol)
+                }
+                if let natural = json["natural_scroll"] as? Bool {
+                    self.isNaturalScroll = natural
                 }
             case "pong":
                 if let sentAt = (json["client_time"] as? Double) ?? (json["timestamp"] as? Double) {
@@ -319,7 +399,7 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
         sendJson(["type": "host_query"])
     }
 
-    // MARK: - Motion Channel (.unreliable Datagram Stream)
+    // MARK: - WMM High-Priority Motion Channel
 
     private func sendMotionPacket(eventType: UInt8, dx: Float, dy: Float, fingers: UInt16 = 1, flags: UInt16 = 0) {
         guard isConnected else { return }
@@ -338,11 +418,11 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
             ptr.storeBytes(of: flags.bigEndian, toByteOffset: 14, as: UInt16.self)
         }
 
-        // Direct hardware-accelerated datagram stream (no TCP head-of-line blocking!)
-        if let peer = connectedPeer, session != nil {
-            try? session.send(buffer, toPeers: [peer], with: .unreliable)
-        } else if let udp = udpConnection {
+        // Prefer direct WMM-tagged UDP socket over MCSession to avoid AWDL channel-hop stutter
+        if let udp = udpConnection {
             udp.send(content: buffer, completion: .idempotent)
+        } else if let peer = connectedPeer, session != nil {
+            try? session.send(buffer, toPeers: [peer], with: .unreliable)
         }
     }
 
@@ -368,24 +448,24 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
         sendMotionPacket(eventType: 0x05, dx: 0, dy: 0)
     }
 
-    // MARK: - Control Channel (.reliable Stream)
+    // MARK: - Control Channel
 
     private func sendJson(_ object: [String: Any]) {
         guard isConnected, let data = try? JSONSerialization.data(withJSONObject: object) else { return }
 
-        if let peer = connectedPeer, session != nil {
-            try? session.send(data, toPeers: [peer], with: .reliable)
-        } else if let tcp = tcpConnection {
+        if let tcp = tcpConnection {
             var length = UInt32(data.count).bigEndian
             var packet = Data(bytes: &length, count: 4)
             packet.append(data)
             tcp.send(content: packet, completion: .contentProcessed { _ in })
+        } else if let peer = connectedPeer, session != nil {
+            try? session.send(data, toPeers: [peer], with: .reliable)
         }
     }
 
     private func startPingLoop() {
         stopPingLoop()
-        pingTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+        pingTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             guard let self = self, self.isConnected else { return }
             let now = Date().timeIntervalSince1970 * 1000
             self.sendJson(["type": "ping", "client_time": now])
@@ -415,7 +495,16 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
         ])
     }
 
+    public func setNaturalScroll(_ enabled: Bool) {
+        isNaturalScroll = enabled
+        sendJson([
+            "type": "settings_update",
+            "natural_scroll": enabled
+        ])
+    }
+
     public func setVolume(_ volume: Float) {
+        hostVolume = volume
         sendJson([
             "type": "media_command",
             "action": "volume_set",
