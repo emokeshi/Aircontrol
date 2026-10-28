@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>AirControl</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.aircontrol.mobile</string>
+    <key>CFBundleName</key>
+    <string>AirControl</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.2.0</string>
+    <key>CFBundleVersion</key>
+    <string>3</string>
+    <key>LSRequiresIPhoneOS</key>
+    <true/>
+    <key>MinimumOSVersion</key>
+    <string>16.0</string>
+    <key>UIDeviceFamily</key>
+    <array>
+        <integer>1</integer>
+        <integer>2</integer>
+    </array>
+    <key>UILaunchStoryboardName</key>
+    <string>LaunchScreen</string>
+    <key>UIRequiredDeviceCapabilities</key>
+    <array>
+        <string>arm64</string>
+    </array>
+    <key>UISupportedInterfaceOrientations</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+    </array>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>AirControl 使用苹果原生无线对等技术自动直连您的 Mac。</string>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>AirControl 使用低功耗蓝牙与 Mac 建立近场极速配对。</string>
+    <key>NSBluetoothPeripheralUsageDescription</key>
+    <string>AirControl 使用低功耗蓝牙与 Mac 建立近场极速配对。</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_aircontrol-p2p._tcp</string>
+        <string>_aircontrol-p2p._udp</string>
+        <string>_aircontrol._tcp</string>
+        <string>_aircontrol._udp</string>
+    </array>
+</dict>
+</plist>

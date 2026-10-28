@@ -1,0 +1,44 @@
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Xcode & Swift
+build/
+DerivedData/
+*.xcodeproj/*
+!*.xcodeproj/project.pbxproj
+!*.xcodeproj/xcshareddata/
+!*.xcworkspace/contents.xcworkspacedata
+*.xcworkspace/*
+!*.xcworkspace/contents.xcworkspacedata
+.build/
+Package.resolved
+
+# Flutter & Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+*.apk
+*.aab
+*.app
+*.ipa
+.pub-cache/
+.pub/
+ephemeral/
+
+# JetBrains / VSCode
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# AirControl local secrets & credentials
+*.pem
+*.key
+auth_tokens.json

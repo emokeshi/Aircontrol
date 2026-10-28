@@ -1,0 +1,303 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A10001 /* AirControlApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10001 /* AirControlApp.swift */; };
+		A10002 /* AppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10002 /* AppState.swift */; };
+		A10003 /* MultipeerClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10003 /* MultipeerClient.swift */; };
+		A10006 /* Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10006 /* Theme.swift */; };
+		A10007 /* TrackpadView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10007 /* TrackpadView.swift */; };
+		A10008 /* DockView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10008 /* DockView.swift */; };
+		A10009 /* KeyboardDeckView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10009 /* KeyboardDeckView.swift */; };
+		A10010 /* MediaDeckView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10010 /* MediaDeckView.swift */; };
+		A10011 /* SystemDeckView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10011 /* SystemDeckView.swift */; };
+		A10012 /* MainView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B10012 /* MainView.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		B00001 /* AirControl.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AirControl.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		B00002 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		B10001 /* AirControlApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AirControlApp.swift; sourceTree = "<group>"; };
+		B10002 /* AppState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppState.swift; sourceTree = "<group>"; };
+		B10003 /* MultipeerClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MultipeerClient.swift; sourceTree = "<group>"; };
+		B10006 /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
+		B10007 /* TrackpadView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TrackpadView.swift; sourceTree = "<group>"; };
+		B10008 /* DockView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DockView.swift; sourceTree = "<group>"; };
+		B10009 /* KeyboardDeckView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyboardDeckView.swift; sourceTree = "<group>"; };
+		B10010 /* MediaDeckView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaDeckView.swift; sourceTree = "<group>"; };
+		B10011 /* SystemDeckView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemDeckView.swift; sourceTree = "<group>"; };
+		B10012 /* MainView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainView.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		C00001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		D00001 = {
+			isa = PBXGroup;
+			children = (
+				D10001 /* Sources */,
+				B00002 /* Info.plist */,
+				D20001 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		D10001 /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				D10002 /* App */,
+				D10003 /* Network */,
+				D10004 /* UI */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+		D10002 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				B10001 /* AirControlApp.swift */,
+				B10002 /* AppState.swift */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		D10003 /* Network */ = {
+			isa = PBXGroup;
+			children = (
+				B10003 /* MultipeerClient.swift */,
+			);
+			path = Network;
+			sourceTree = "<group>";
+		};
+		D10004 /* UI */ = {
+			isa = PBXGroup;
+			children = (
+				B10006 /* Theme.swift */,
+				B10007 /* TrackpadView.swift */,
+				B10008 /* DockView.swift */,
+				B10009 /* KeyboardDeckView.swift */,
+				B10010 /* MediaDeckView.swift */,
+				B10011 /* SystemDeckView.swift */,
+				B10012 /* MainView.swift */,
+			);
+			path = UI;
+			sourceTree = "<group>";
+		};
+		D20001 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				B00001 /* AirControl.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		E00001 /* AirControl */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = F00001 /* Build configuration list for PBXNativeTarget "AirControl" */;
+			buildPhases = (
+				C10001 /* Sources */,
+				C00001 /* Frameworks */,
+				C20001 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = AirControl;
+			productName = AirControl;
+			productReference = B00001 /* AirControl.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastUpgradeCheck = 1500;
+				TargetAttributes = {
+					E00001 = {
+						CreatedOnToolsVersion = 15.0;
+					};
+				};
+			};
+			buildConfigurationList = F10001 /* Build configuration list for PBXProject "AirControl" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = D00001;
+			productRefGroup = D20001 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				E00001 /* AirControl */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		C20001 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		C10001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10001 /* AirControlApp.swift in Sources */,
+				A10002 /* AppState.swift in Sources */,
+				A10003 /* MultipeerClient.swift in Sources */,
+				A10006 /* Theme.swift in Sources */,
+				A10007 /* TrackpadView.swift in Sources */,
+				A10008 /* DockView.swift in Sources */,
+				A10009 /* KeyboardDeckView.swift in Sources */,
+				A10010 /* MediaDeckView.swift in Sources */,
+				A10011 /* SystemDeckView.swift in Sources */,
+				A10012 /* MainView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		G00001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		G00002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		G10001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.aircontrol.mobile;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		G10002 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Info.plist;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 1.0.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.aircontrol.mobile;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		F10001 /* Build configuration list for PBXProject "AirControl" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				G00001 /* Debug */,
+				G00002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		F00001 /* Build configuration list for PBXNativeTarget "AirControl" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				G10001 /* Debug */,
+				G10002 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+	};
+	rootObject = 000001 /* Project object */;
+}
