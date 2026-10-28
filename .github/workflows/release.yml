@@ -21,16 +21,17 @@ jobs:
       - name: Publish GitHub Release Assets
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v1.3.3' }}
-          name: "AirControl v1.3.3"
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v1.3.4' }}
+          name: "AirControl v1.3.4"
           body: |
-            ### AirControl v1.3.3 更新内容
-            - **电脑端 (`AirControl-macOS.zip`)**：解压后打开 `AirControl.app`，点击顶部菜单栏图标即可使用。
+            ### AirControl v1.3.4 更新内容
+            - **电脑端 (`AirControl-macOS.zip`)**：解压后打开 `AirControl.app`，点击顶部菜单栏图标即可使用。已内置 120Hz 帧率平滑突发吸收引擎 + 异步 `CGEvent` 注入。
             - **手机端 (`AirControl.ipa`)**：支持 SideStore、AltStore、TrollStore 或爱思助手安装，已内置完整 iOS 桌面图标。
             - **核心改进**：
-              1. 彻底攻克纯 Wi-Fi（包括联发科 `MTK_driverkit` 网卡）下的指针卡顿：双端主动 15ms (66Hz) 802.11 PM=0 网卡保活脉冲 + 彻底关闭 `awdl0` 切信道扫描 + 1-Packet 前向纠错（FEC）抗丢包 + 单线程 40µs 极速 `CGEvent` 注入；
-              2. 修复唤醒失败（支持息屏后直接亮屏 + 绑定 `en0` 子网广播唤醒）及睡眠/锁屏/重启/关机全部电源动作；
-              3. 优化键盘输入框体验：支持中文拼音与连续语音输入，点击「发送」后自动清空输入框。
+              1. **120Hz 帧率平滑突发吸收引擎**：彻底根除 60Hz 锯齿状指数衰减抖动（Ripple Stutter），正常包 0ms 即时传递，遇到 Wi-Fi 突发包自动缓冲并在 8ms (120Hz) 节拍下均匀平滑输出；
+              2. **异步 `CGEvent` 注入**：将鼠标事件与网络接收队列彻底解耦，彻底消除 WindowServer VBL 阻塞导致的 UDP 丢包卡顿；
+              3. **低速精准微操优化**：修复低速滑动时光标冻结与跳顿，支持超低速连续平滑微调；
+              4. **严格位移守恒与休眠节能**：100% 物理位移守恒，无反弹漂移；空闲时定时器完全休眠，0 CPU 唤醒。
           files: |
             dist/AirControl-macOS.zip
             dist/AirControl.ipa
