@@ -53,7 +53,13 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
     private var connectedPeer: MCPeerID?
     private var pingTimer: Timer?
     private var reconnectTimer: Timer?
+    private var keepAwakeTimer: DispatchSourceTimer?
+    private var lastUdpTxTimeNs: UInt64 = 0
     private var sequenceNumber: UInt16 = 0
+    private var prevMoveDx: Float = 0
+    private var prevMoveDy: Float = 0
+    private var prevMoveEventType: UInt8 = 0
+    private var hasPrevMoveDelta: Bool = false
     private var lastUdpPongTime: TimeInterval = 0
     private var dockRequestTimestampMs: Double = 0
     private var requestedIconBundleIds: Set<String> = []
@@ -71,7 +77,7 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
 
     public var activeMotionChannelName: String {
         if isUdpVerified {
-            return "UDP语音级直连 (\(hostIP):8920)"
+            return "UDP直连 (\(hostIP):8920)"
         } else if isTcpReady {
             return "TCP直连 (\(hostIP):8921)"
         } else if connectedPeer != nil {
@@ -145,11 +151,11 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
             WakeOnLAN.wake(mac: savedMac, completion: nil)
         }
 
-        // 3. Discovery fallback (automatically stops as soon as connected to prevent Wi-Fi scan stutter)
+        // 3. Pure LAN Bonjour Discovery (awdl0 peer-to-peer strictly disabled to prevent 102.4ms channel hopping)
         if !isConnected {
-            browser.startBrowsingForPeers()
             netBrowser?.stop()
             netBrowser = NetServiceBrowser()
+            netBrowser?.includesPeerToPeer = false
             netBrowser?.delegate = self
             netBrowser?.searchForServices(ofType: "_aircontrol._tcp.", inDomain: "")
         }
@@ -188,9 +194,9 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
         DiagnosticLogger.shared.log("CONN", "Manual rescan triggered")
         discoveredHosts.removeAll()
         isSearching = true
-        browser?.startBrowsingForPeers()
         netBrowser?.stop()
         netBrowser = NetServiceBrowser()
+        netBrowser?.includesPeerToPeer = false
         netBrowser?.delegate = self
         netBrowser?.searchForServices(ofType: "_aircontrol._tcp.", inDomain: "")
     }
@@ -349,6 +355,7 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
     // MARK: - Direct WMM UDP + TCP_NODELAY Socket Engine (VPN Bypass + Multi-IP Racing)
 
     public func netServiceBrowser(_ browser: NetServiceBrowser, didFind service: NetService, moreComing: Bool) {
+        service.includesPeerToPeer = false
         service.delegate = self
         resolvingServices.append(service)
         service.resolve(withTimeout: 3.0)
@@ -395,11 +402,11 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
         if udpConnections[host] != nil { return }
 
         let udpParams = NWParameters.udp
-        // Force physical Wi-Fi interface (en0) on iOS, bypassing VPN utun5 (10.7.1.1) and Cellular pdp_ip0!
-        // Use .interactiveVoice (802.11e WMM AC_VO: CWmin=3, CWmax=7, zero A-MPDU aggregation delay)
+        // Force physical Wi-Fi interface (en0) on iOS, bypassing VPN utun5 (10.7.1.1), Cellular pdp_ip0, and awdl0!
+        udpParams.includePeerToPeer = false
         udpParams.requiredInterfaceType = .wifi
         udpParams.prohibitedInterfaceTypes = [.other, .cellular]
-        udpParams.serviceClass = .interactiveVoice
+        udpParams.serviceClass = .interactiveVideo
 
         let udpEndpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!)
         let udp = NWConnection(to: udpEndpoint, using: udpParams)
@@ -428,6 +435,7 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
             ptr.storeBytes(of: UInt8(0xFE), toByteOffset: 1, as: UInt8.self)
             ptr.storeBytes(of: nowMs.bigEndian, toByteOffset: 8, as: UInt64.self)
         }
+        self.lastUdpTxTimeNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         for (_, udp) in udpConnections {
             udp.send(content: probe, completion: .idempotent)
         }
@@ -492,10 +500,11 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
         tcpOptions.noDelay = true
         tcpOptions.connectionTimeout = 3
         let tcpParams = NWParameters(tls: nil, tcp: tcpOptions)
-        // Force physical Wi-Fi interface (en0) on iOS, bypassing VPN utun5 and Cellular pdp_ip0!
+        // Force physical Wi-Fi interface (en0) on iOS, bypassing VPN utun5, Cellular pdp_ip0, and awdl0!
+        tcpParams.includePeerToPeer = false
         tcpParams.requiredInterfaceType = .wifi
         tcpParams.prohibitedInterfaceTypes = [.other, .cellular]
-        tcpParams.serviceClass = .interactiveVoice
+        tcpParams.serviceClass = .interactiveVideo
 
         let tcpEndpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: tcpPort)!)
         let tcp = NWConnection(to: tcpEndpoint, using: tcpParams)
@@ -738,22 +747,46 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
             finalFlags |= 0x80
         }
 
+        let isContinuousMotion = (eventType == 0x01 || eventType == 0x02 || eventType == 0x03)
+        let shouldPiggybackFec = isContinuousMotion && !isStrokeStart && hasPrevMoveDelta && (prevMoveEventType == eventType)
+        let wireEventType: UInt8 = shouldPiggybackFec ? (eventType | 0x40) : eventType
+
         var buffer = Data(count: 16)
         buffer.withUnsafeMutableBytes { raw in
             guard let ptr = raw.baseAddress else { return }
             ptr.storeBytes(of: UInt8(0xA8), toByteOffset: 0, as: UInt8.self)
-            ptr.storeBytes(of: eventType, toByteOffset: 1, as: UInt8.self)
+            ptr.storeBytes(of: wireEventType, toByteOffset: 1, as: UInt8.self)
             ptr.storeBytes(of: sequenceNumber.bigEndian, toByteOffset: 2, as: UInt16.self)
             ptr.storeBytes(of: dx.bitPattern.bigEndian, toByteOffset: 4, as: UInt32.self)
             ptr.storeBytes(of: dy.bitPattern.bigEndian, toByteOffset: 8, as: UInt32.self)
-            ptr.storeBytes(of: fingers.bigEndian, toByteOffset: 12, as: UInt16.self)
-            ptr.storeBytes(of: finalFlags.bigEndian, toByteOffset: 14, as: UInt16.self)
+            if shouldPiggybackFec {
+                // 1-Packet Forward Error Correction (FEC):
+                // Pack previous packet's (prevDx, prevDy) as Q11.5 fixed-point Int16 in bytes 12..15.
+                // If packet (seq - 1) was dropped by Wi-Fi, the Mac host recovers it on arrival with 0 extra packets!
+                let prevDxFixed = Int16(clamping: Int((prevMoveDx * 32.0).rounded()))
+                let prevDyFixed = Int16(clamping: Int((prevMoveDy * 32.0).rounded()))
+                ptr.storeBytes(of: prevDxFixed.bigEndian, toByteOffset: 12, as: Int16.self)
+                ptr.storeBytes(of: prevDyFixed.bigEndian, toByteOffset: 14, as: Int16.self)
+            } else {
+                ptr.storeBytes(of: fingers.bigEndian, toByteOffset: 12, as: UInt16.self)
+                ptr.storeBytes(of: finalFlags.bigEndian, toByteOffset: 14, as: UInt16.self)
+            }
+        }
+
+        if isContinuousMotion {
+            prevMoveDx = dx
+            prevMoveDy = dy
+            prevMoveEventType = eventType
+            hasPrevMoveDelta = true
+        } else {
+            hasPrevMoveDelta = false
         }
 
         var sentViaUdp = false
         var sentViaTcp = false
 
-        // 1. Primary: WMM Voice (AC_VO) UDP to the active host IP (zero TCP ACK reverse-path Wi-Fi collisions!)
+        // 1. Primary: WMM InteractiveVideo (CS4 / AC_VI) UDP to the active host IP (zero TCP ACK reverse-path Wi-Fi collisions!)
+        self.lastUdpTxTimeNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         if let primaryUdp = udpConnections[hostIP] {
             primaryUdp.send(content: buffer, completion: .idempotent)
             sentViaUdp = true
@@ -843,11 +876,36 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
                 self.isUdpVerified = false
             }
         }
+
+        // Proactive 15ms (66Hz) 802.11 PM=0 Client Radio Keep-Awake Timer:
+        // Prevents both the iPhone Wi-Fi radio and the Mac's MediaTek MTK_driverkit-342.6 Wi-Fi chip
+        // from entering 102.4ms Beacon sleep (PM=1) during finger pauses!
+        let timer = DispatchSource.makeTimerSource(flags: .strict, queue: socketQueue)
+        timer.schedule(deadline: .now() + .milliseconds(15), repeating: .milliseconds(15), leeway: .milliseconds(1))
+        timer.setEventHandler { [weak self] in
+            guard let self = self, self.isConnected else { return }
+            let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+            if (now - self.lastUdpTxTimeNs) >= 13_000_000 {
+                self.lastUdpTxTimeNs = now
+                let keepAwake = Data([0xA8, 0xFC, 0x00, 0x00])
+                if let primaryUdp = self.udpConnections[self.hostIP] {
+                    primaryUdp.send(content: keepAwake, completion: .idempotent)
+                } else {
+                    for (_, udp) in self.udpConnections {
+                        udp.send(content: keepAwake, completion: .idempotent)
+                    }
+                }
+            }
+        }
+        timer.resume()
+        self.keepAwakeTimer = timer
     }
 
     private func stopPingLoop() {
         pingTimer?.invalidate()
         pingTimer = nil
+        keepAwakeTimer?.cancel()
+        keepAwakeTimer = nil
     }
 
     public func sendTextCommit(_ text: String) {

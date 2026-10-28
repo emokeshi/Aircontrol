@@ -10,6 +10,8 @@ public final class SocketServer: @unchecked Sendable {
     private var udpListener: NWListener?
     private var netService: NetService?
     private var activeTcpConnection: NWConnection?
+    private var activeUdpConnection: NWConnection?
+    private var radioKeepAwakeTimer: DispatchSourceTimer?
     private let udpQueue = DispatchQueue(label: "com.aircontrol.socket.udp", qos: .userInteractive)
     private let tcpQueue = DispatchQueue(label: "com.aircontrol.socket.tcp", qos: .userInteractive)
 
@@ -46,26 +48,29 @@ public final class SocketServer: @unchecked Sendable {
 
         startUdp(port: udpPort)
         startTcp(port: tcpPort)
+        startRadioKeepAwakeLoop()
         publishBonjour(port: tcpPort)
         isRunning = true
 
-        DiagnosticLogger.shared.log("NET", "SocketServer listening on TCP:\(tcpPort) UDP:\(udpPort) (VPN utun bypassed)")
+        DiagnosticLogger.shared.log("NET", "SocketServer listening on TCP:\(tcpPort) UDP:\(udpPort) (15ms PM=0 KeepAwake active, awdl0 disabled)")
 
         SystemController.shared.startWorkspaceMonitoring(
             onAppListChanged: { [weak self] in
                 self?.broadcastDockApps()
-                MultipeerServer.shared.broadcastDockApps()
             },
             onActiveAppChanged: { [weak self] activeBundleId in
                 self?.broadcastActiveApp(bundleId: activeBundleId)
-                MultipeerServer.shared.broadcastActiveApp(bundleId: activeBundleId)
             }
         )
     }
 
     public func stop() {
+        radioKeepAwakeTimer?.cancel()
+        radioKeepAwakeTimer = nil
         netService?.stop()
         netService = nil
+        activeUdpConnection?.cancel()
+        activeUdpConnection = nil
         activeTcpConnection?.cancel()
         activeTcpConnection = nil
         tcpListener?.cancel()
@@ -75,9 +80,30 @@ public final class SocketServer: @unchecked Sendable {
         isRunning = false
     }
 
+    /// Proactive 15ms (66Hz) 802.11 PM=0 Radio Keep-Awake Timer:
+    /// MediaTek `MTK_driverkit-342.6` (0x14C3:0x7932) enters 102.4ms 802.11 Beacon sleep (PM=1) after ~25ms of TX inactivity.
+    /// Transmitting a 4-byte UDP pulse every 15ms while a client is connected locks `en0` in PM=0 (5ms RTT, 0ms sleep) 100% of the time!
+    private func startRadioKeepAwakeLoop() {
+        radioKeepAwakeTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(flags: .strict, queue: udpQueue)
+        timer.schedule(deadline: .now() + .milliseconds(15), repeating: .milliseconds(15), leeway: .milliseconds(1))
+        timer.setEventHandler { [weak self] in
+            guard let self = self, let udp = self.activeUdpConnection else { return }
+            let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+            if (now - self.lastKeepAwakeReplyNs) >= 13_000_000 {
+                self.lastKeepAwakeReplyNs = now
+                let keepAwake = Data([0xA8, 0xFD, 0x00, 0x00])
+                udp.send(content: keepAwake, completion: .idempotent)
+            }
+        }
+        timer.resume()
+        self.radioKeepAwakeTimer = timer
+    }
+
     private func publishBonjour(port: UInt16) {
         let hostName = Host.current().localizedName ?? "Mac"
         netService = NetService(domain: "", type: "_aircontrol._tcp.", name: hostName, port: Int32(port))
+        netService?.includesPeerToPeer = false
         netService?.publish()
     }
 
@@ -86,7 +112,8 @@ public final class SocketServer: @unchecked Sendable {
     private func startUdp(port: UInt16) {
         let params = NWParameters.udp
         params.allowLocalEndpointReuse = true
-        params.serviceClass = .interactiveVoice
+        params.includePeerToPeer = false
+        params.serviceClass = .interactiveVideo
         // Bypass virtual VPN TUN interfaces (utun) which have interface type .other
         params.prohibitedInterfaceTypes = [.other]
 
@@ -100,32 +127,43 @@ public final class SocketServer: @unchecked Sendable {
     }
 
     private func handleUdpConnection(_ connection: NWConnection) {
+        self.activeUdpConnection = connection
         connection.start(queue: udpQueue)
         func receiveNext() {
             connection.receiveMessage { [weak self, weak connection] content, _, _, error in
                 guard let self = self, let connection = connection, let data = content, error == nil else {
+                    if self?.activeUdpConnection === connection {
+                        self?.activeUdpConnection = nil
+                    }
                     connection?.cancel()
                     return
                 }
-                if data.count >= 16 && data[0] == 0xA8 {
+                self.activeUdpConnection = connection
+                if data.count >= 4 && data[0] == 0xA8 {
                     let eventType = data[1]
-                    if eventType == 0xFE {
-                        // Active UDP Echo Probe: immediately echo back 0xA8 0xFF with identical payload
-                        var reply = data
-                        reply[1] = 0xFF
-                        connection.send(content: reply, completion: .idempotent)
-                        if self.activeTcpConnection != nil {
-                            MultipeerServer.shared.suspendForDirectSocket()
-                        }
-                    } else {
-                        self.processMotionPacket(data, isUdp: true)
-                        // Send a 4-byte 802.11 PM=0 Radio Keep-Awake pulse every 150ms during active motion
-                        // (keeps en0 awake without creating half-duplex reverse Wi-Fi collisions)
+                    if eventType == 0xFC {
+                        // Client 15ms idle keep-awake pulse: reply if needed
                         let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-                        if (now - self.lastKeepAwakeReplyNs) >= 150_000_000 {
+                        if (now - self.lastKeepAwakeReplyNs) >= 13_000_000 {
                             self.lastKeepAwakeReplyNs = now
-                            let keepAwake = Data([0xA8, 0xFD, data[2], data[3]])
+                            let keepAwake = Data([0xA8, 0xFD, 0x00, 0x00])
                             connection.send(content: keepAwake, completion: .idempotent)
+                        }
+                    } else if data.count >= 16 {
+                        if eventType == 0xFE {
+                            // Active UDP Echo Probe: immediately echo back 0xA8 0xFF with identical payload
+                            var reply = data
+                            reply[1] = 0xFF
+                            self.lastKeepAwakeReplyNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+                            connection.send(content: reply, completion: .idempotent)
+                        } else {
+                            self.processMotionPacket(data, isUdp: true)
+                            let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+                            if (now - self.lastKeepAwakeReplyNs) >= 13_000_000 {
+                                self.lastKeepAwakeReplyNs = now
+                                let keepAwake = Data([0xA8, 0xFD, data[2], data[3]])
+                                connection.send(content: keepAwake, completion: .idempotent)
+                            }
                         }
                     }
                 }
@@ -150,15 +188,29 @@ public final class SocketServer: @unchecked Sendable {
         return true
     }
 
+    private func hasSeenSequence(_ seq: UInt16) -> Bool {
+        os_unfair_lock_lock(&seqLock)
+        for i in 0..<128 {
+            if seenSeqValid[i] && seenSeqRing[i] == seq {
+                os_unfair_lock_unlock(&seqLock)
+                return true
+            }
+        }
+        os_unfair_lock_unlock(&seqLock)
+        return false
+    }
+
     public func processMotionPacket(_ data: Data, isUdp: Bool = true) {
         data.withUnsafeBytes { raw in
             guard let ptr = raw.baseAddress else { return }
 
-            let eventType = ptr.load(fromByteOffset: 1, as: UInt8.self)
+            let rawEventType = ptr.load(fromByteOffset: 1, as: UInt8.self)
+            let hasPiggybackFec = (rawEventType & 0x40) != 0
+            let eventType = rawEventType & 0x3F
+
             let rawSeq = ptr.load(fromByteOffset: 2, as: UInt16.self)
             let seq = UInt16(bigEndian: rawSeq)
 
-            // Multi-path race deduplication: whichever path (en3 UDP, en0 UDP, or TCP_NODELAY) arrives first wins!
             if !checkAndMarkSequence(seq) {
                 DiagnosticLogger.shared.recordDuplicateDrop()
                 return
@@ -166,14 +218,26 @@ public final class SocketServer: @unchecked Sendable {
 
             let rawFlags = ptr.load(fromByteOffset: 14, as: UInt16.self)
             let flags = UInt16(bigEndian: rawFlags)
-            let isStrokeStart = (flags & 0x80) != 0
+            let isStrokeStart = !hasPiggybackFec && ((flags & 0x80) != 0)
+
+            var dx = Float(bitPattern: UInt32(bigEndian: ptr.load(fromByteOffset: 4, as: UInt32.self)))
+            var dy = Float(bitPattern: UInt32(bigEndian: ptr.load(fromByteOffset: 8, as: UInt32.self)))
+
+            // 1-Packet Forward Error Correction (FEC):
+            // If packet (seq - 1) was dropped by Wi-Fi and this packet carries piggybacked (prevDx, prevDy) in bytes 12..15,
+            // recover (prevDx, prevDy) immediately so zero cursor displacement is lost!
+            if hasPiggybackFec {
+                let prevSeq = seq &- 1
+                if !hasSeenSequence(prevSeq) {
+                    _ = checkAndMarkSequence(prevSeq)
+                    let prevDxFixed = Int16(bigEndian: ptr.load(fromByteOffset: 12, as: Int16.self))
+                    let prevDyFixed = Int16(bigEndian: ptr.load(fromByteOffset: 14, as: Int16.self))
+                    dx += Float(prevDxFixed) / 32.0
+                    dy += Float(prevDyFixed) / 32.0
+                }
+            }
 
             DiagnosticLogger.shared.recordMotionRx(isUdp: isUdp, seq: seq, isStrokeStart: isStrokeStart)
-
-            let rawDx = ptr.load(fromByteOffset: 4, as: UInt32.self)
-            let rawDy = ptr.load(fromByteOffset: 8, as: UInt32.self)
-            let dx = Float(bitPattern: UInt32(bigEndian: rawDx))
-            let dy = Float(bitPattern: UInt32(bigEndian: rawDy))
 
             switch eventType {
             case 0x01:
@@ -212,7 +276,8 @@ public final class SocketServer: @unchecked Sendable {
 
         let params = NWParameters(tls: nil, tcp: tcpOptions)
         params.allowLocalEndpointReuse = true
-        params.serviceClass = .interactiveVoice
+        params.includePeerToPeer = false
+        params.serviceClass = .interactiveVideo
         params.prohibitedInterfaceTypes = [.other]
 
         guard let listener = try? NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!) else { return }

@@ -138,7 +138,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate 
     }
 
     private func startServices() {
-        MultipeerServer.shared.start()
+        // Pure LAN TCP/UDP + Bonjour only (do NOT start MultipeerServer so awdl0 never hops off the 5GHz Wi-Fi channel!)
         SocketServer.shared.start(tcpPort: 8921, udpPort: 8920)
         AppState.shared.isRunning = true
     }
