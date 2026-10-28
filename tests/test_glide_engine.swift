@@ -10,29 +10,38 @@ func assertTest(_ condition: Bool, _ message: String) {
     }
 }
 
-print("\n--- Test: Anti-Jitter Frame-Paced Engine & Dead Reckoning Mathematics ---")
+print("\n--- Test: 120Hz Frame-Paced Anti-Jitter Engine & Burst Absorption ---")
 
-// Simulation of the Anti-Jitter Glide Engine
-class MockGlideEngine {
+// High-fidelity simulation of the 120Hz Frame-Paced Burst Absorption Engine
+class MockFramePacedEngine {
     var cachedX: Double = 100.0
     var cachedY: Double = 100.0
     var pendingDx: Double = 0.0
     var pendingDy: Double = 0.0
-    var borrowedDx: Double = 0.0
-    var borrowedDy: Double = 0.0
-    var velX: Double = 0.0
-    var velY: Double = 0.0
-    var lastPacketTimestamp: UInt64 = 0
-    var lastTickTimestamp: UInt64 = 0
+    var lastPostTime: UInt64 = 0
+    var avgPacketMag: Double = 10.0
+    var isTimerArmed: Bool = false
     var lastAccel: Float = 1.8
-    var posts: [CGPoint] = []
+    var lastActivityTimestamp: UInt64 = 0
+    var posts: [(time: Double, pt: CGPoint, isImmediate: Bool)] = []
 
-    func move(dx: Float, dy: Float, isStrokeStart: Bool, now: UInt64) {
+    func postDirectLocked(dx: Double, dy: Double, now: UInt64, isImmediate: Bool) -> CGPoint {
+        cachedX += dx
+        cachedY += dy
+        lastPostTime = now
+        let pt = CGPoint(x: cachedX, y: cachedY)
+        posts.append((Double(now)/1_000_000.0, pt, isImmediate))
+        return pt
+    }
+
+    func move(dx: Float, dy: Float, isStrokeStart: Bool = false, now: UInt64) -> (shouldPost: Bool, pt: CGPoint, timerDelayMs: Double?) {
+        guard dx != 0 || dy != 0 else { return (false, .zero, nil) }
+
         let dist = hypotf(dx, dy)
         let baseGain: Float = 1.8
         let rawAccel = baseGain * (1.0 + min(dist * 0.10, 1.8))
 
-        let isFreshStroke = isStrokeStart || lastPacketTimestamp == 0 || (now - lastPacketTimestamp) > 40_000_000
+        let isFreshStroke = isStrokeStart || lastActivityTimestamp == 0 || (now - lastActivityTimestamp) > 75_000_000
         if isFreshStroke {
             lastAccel = baseGain
         } else {
@@ -42,106 +51,90 @@ class MockGlideEngine {
 
         let deltaX = Double(dx * accel)
         let deltaY = Double(dy * accel)
+        let incomingMag = hypot(deltaX, deltaY)
+        avgPacketMag = avgPacketMag * 0.70 + incomingMag * 0.30
 
-        let dtPacket = lastPacketTimestamp > 0 ? min(Double(now - lastPacketTimestamp) / 1_000_000.0, 35.0) : 16.67
-        if dtPacket > 1.0 {
-            let vx = deltaX / dtPacket
-            let vy = deltaY / dtPacket
-            if isFreshStroke {
-                velX = vx
-                velY = vy
-            } else {
-                velX = velX * 0.60 + vx * 0.40
-                velY = velY * 0.60 + vy * 0.40
-            }
-        }
+        pendingDx += deltaX
+        pendingDy += deltaY
 
-        if isFreshStroke {
-            let stepX = deltaX * 0.75
-            let stepY = deltaY * 0.75
-            pendingDx = deltaX - stepX
-            pendingDy = deltaY - stepY
-            borrowedDx = 0.0
-            borrowedDy = 0.0
-            cachedX += stepX
-            cachedY += stepY
-            posts.append(CGPoint(x: cachedX, y: cachedY))
-        } else {
-            var finalDeltaX = deltaX
-            var finalDeltaY = deltaY
-            if borrowedDx != 0.0 {
-                if (finalDeltaX > 0 && borrowedDx > 0) || (finalDeltaX < 0 && borrowedDx < 0) {
-                    let absorb = (finalDeltaX > 0) ? min(finalDeltaX, borrowedDx) : max(finalDeltaX, borrowedDx)
-                    finalDeltaX -= absorb
-                    borrowedDx -= absorb
-                } else {
-                    borrowedDx = 0.0
-                }
-            }
-            if borrowedDy != 0.0 {
-                if (finalDeltaY > 0 && borrowedDy > 0) || (finalDeltaY < 0 && borrowedDy < 0) {
-                    let absorb = (finalDeltaY > 0) ? min(finalDeltaY, borrowedDy) : max(finalDeltaY, borrowedDy)
-                    finalDeltaY -= absorb
-                    borrowedDy -= absorb
-                } else {
-                    borrowedDy = 0.0
-                }
-            }
-            pendingDx += finalDeltaX
-            pendingDy += finalDeltaY
-        }
-        lastPacketTimestamp = now
-    }
+        let sinceLastPostNs = lastPostTime > 0 ? (now - lastPostTime) : 200_000_000
+        let minIntervalNs: UInt64 = 8_000_000 // 8ms (120Hz cadence)
 
-    func tick(now: UInt64) {
-        let dtMs: Double
-        if lastTickTimestamp > 0 {
-            dtMs = min(max(Double(now - lastTickTimestamp) / 1_000_000.0, 1.5), 12.0)
-        } else {
-            dtMs = 4.16
-        }
-        lastTickTimestamp = now
+        var pt: CGPoint = .zero
+        var shouldPost = false
+        var timerDelayMs: Double? = nil
 
-        let sinceLastPacketMs = lastPacketTimestamp > 0 ? (Double(now - lastPacketTimestamp) / 1_000_000.0) : 1000.0
-        let pendingMag = hypot(pendingDx, pendingDy)
+        if isFreshStroke || sinceLastPostNs >= minIntervalNs {
+            let pendingMag = hypot(pendingDx, pendingDy)
+            let hasPriorBacklog = pendingMag > (incomingMag * 1.15)
+            let maxImmediate = (isFreshStroke || !hasPriorBacklog) ? 1e9 : max(incomingMag, avgPacketMag * 1.35)
 
-        var stepX: Double = 0.0
-        var stepY: Double = 0.0
-
-        if pendingMag > 0.05 {
-            if pendingMag < 0.6 {
+            let stepX: Double
+            let stepY: Double
+            if pendingMag <= maxImmediate {
                 stepX = pendingDx
                 stepY = pendingDy
                 pendingDx = 0.0
                 pendingDy = 0.0
+                isTimerArmed = false
             } else {
-                let drainRatio = min(0.60, max(0.35, 1.0 / (16.0 / dtMs)))
-                stepX = pendingDx * drainRatio
-                stepY = pendingDy * drainRatio
+                let ratio = maxImmediate / pendingMag
+                stepX = pendingDx * ratio
+                stepY = pendingDy * ratio
                 pendingDx -= stepX
                 pendingDy -= stepY
             }
-        } else if sinceLastPacketMs < 35.0 && (abs(velX) > 0.02 || abs(velY) > 0.02) {
-            let decay = max(0.0, 1.0 - (sinceLastPacketMs - 16.0) / 19.0)
-            stepX = velX * dtMs * decay * 0.50
-            stepY = velY * dtMs * decay * 0.50
-            borrowedDx += stepX
-            borrowedDy += stepY
+
+            pt = postDirectLocked(dx: stepX, dy: stepY, now: now, isImmediate: true)
+            shouldPost = true
+
+            let hasRemaining = hypot(pendingDx, pendingDy) >= 0.05
+            if hasRemaining && !isTimerArmed {
+                isTimerArmed = true
+                timerDelayMs = 8.0
+            }
         } else {
-            velX = 0.0
-            velY = 0.0
-            pendingDx = 0.0
-            pendingDy = 0.0
-            borrowedDx = 0.0
-            borrowedDy = 0.0
+            // Rapid packet arrival (< 8ms since last post): buffer into pending and arm timer
+            if !isTimerArmed {
+                isTimerArmed = true
+                let remainingNs = minIntervalNs - sinceLastPostNs
+                timerDelayMs = max(1.0, Double(remainingNs) / 1_000_000.0)
+            }
         }
 
-        let stepMag = hypot(stepX, stepY)
-        if stepMag > 0.02 {
-            cachedX += stepX
-            cachedY += stepY
-            posts.append(CGPoint(x: cachedX, y: cachedY))
+        lastActivityTimestamp = now
+        return (shouldPost, pt, timerDelayMs)
+    }
+
+    func tickPacer(now: UInt64) -> (shouldPost: Bool, pt: CGPoint, rearmDelayMs: Double?) {
+        let pendingMag = hypot(pendingDx, pendingDy)
+        if pendingMag < 0.05 {
+            pendingDx = 0.0
+            pendingDy = 0.0
+            isTimerArmed = false
+            return (false, .zero, nil)
         }
+
+        let maxStep = max(2.0, avgPacketMag * 1.35)
+        let stepX: Double
+        let stepY: Double
+        if pendingMag <= maxStep {
+            stepX = pendingDx
+            stepY = pendingDy
+            pendingDx = 0.0
+            pendingDy = 0.0
+            isTimerArmed = false
+        } else {
+            let ratio = maxStep / pendingMag
+            stepX = pendingDx * ratio
+            stepY = pendingDy * ratio
+            pendingDx -= stepX
+            pendingDy -= stepY
+        }
+
+        let pt = postDirectLocked(dx: stepX, dy: stepY, now: now, isImmediate: false)
+        let hasRemaining = hypot(pendingDx, pendingDy) >= 0.05
+        return (true, pt, hasRemaining ? 8.0 : nil)
     }
 
     func flush() -> CGPoint {
@@ -149,69 +142,89 @@ class MockGlideEngine {
         cachedY += pendingDy
         pendingDx = 0.0
         pendingDy = 0.0
-        velX = 0.0
-        velY = 0.0
-        borrowedDx = 0.0
-        borrowedDy = 0.0
+        isTimerArmed = false
         return CGPoint(x: cachedX, y: cachedY)
     }
 }
 
-// 1. Test Stroke Start (instant 75% step)
-let engine = MockGlideEngine()
-engine.move(dx: 10.0, dy: 0.0, isStrokeStart: true, now: 1_000_000_000)
-assertTest(engine.posts.count == 1, "Immediate post on stroke start")
-assertTest(abs(engine.cachedX - 113.5) < 0.1, "Cursor stepped 75% of (10 * 1.8) immediately: \(engine.cachedX)")
-assertTest(abs(engine.pendingDx - 4.5) < 0.1, "Remaining 25% placed in pending reservoir: \(engine.pendingDx)")
+let engine = MockFramePacedEngine()
+var curTime: UInt64 = 1_000_000_000
 
-// 2. Test 240Hz glide drain
-engine.tick(now: 1_004_166_667)
-assertTest(engine.posts.count == 2, "Second post on first timer tick")
-let firstTickX = engine.cachedX
-assertTest(firstTickX > 113.5, "Cursor progressed smoothly during tick: \(firstTickX)")
+// 1. Test Stroke Start (instant 100% step, 0ms lag)
+let rStart = engine.move(dx: 10.0, dy: 0.0, isStrokeStart: true, now: curTime)
+assertTest(rStart.shouldPost, "Stroke start immediately posted to screen")
+assertTest(abs(engine.cachedX - 118.0) < 1e-4, "Cursor moved exact 10 * 1.8 = 18.0px immediately: \(engine.cachedX)")
+assertTest(engine.pendingDx == 0.0, "Pending reservoir is completely clean: \(engine.pendingDx)")
+assertTest(!engine.isTimerArmed, "Timer remains dormant on stroke start (zero idle wakeups)")
 
-// Drain the rest of the reservoir over ticks up to 24ms
-var curTime: UInt64 = 1_004_166_667
-for _ in 1...6 {
-    curTime += 4_166_667
-    engine.tick(now: curTime)
+// 2. Test Normal 60Hz Streaming (~16.67ms packet interval)
+var prePos = engine.cachedX
+for i in 1...4 {
+    curTime += 16_666_667
+    let r = engine.move(dx: 10.0, dy: 0.0, isStrokeStart: false, now: curTime)
+    assertTest(r.shouldPost, "60Hz packet #\(i) posted immediately without lag")
+    assertTest(!engine.isTimerArmed, "Timer stays disarmed during normal 60Hz streaming")
 }
-assertTest(engine.pendingDx == 0.0, "Pending reservoir drained to 0 before stall: \(engine.pendingDx)")
+let total60HzDist = engine.cachedX - prePos
+assertTest(total60HzDist > 72.0 && abs(engine.pendingDx) < 1e-4, "Exact accelerated displacement delivered with 0 pending: \(total60HzDist)")
 
-// 3. Test Wi-Fi packet stall with dead-reckoning extrapolation
-// Simulate stall: curTime is now > 20ms since last packet (which was at 1_000_000_000)
-let preStallPosts = engine.posts.count
-let preStallX = engine.cachedX
-curTime += 4_166_667 // ~25ms since last packet
-engine.tick(now: curTime)
-assertTest(engine.posts.count > preStallPosts, "Dead-reckoning posted extrapolated movement during Wi-Fi stall!")
-assertTest(engine.cachedX > preStallX, "Cursor advanced forward during stall: \(engine.cachedX) > \(preStallX)")
-assertTest(engine.borrowedDx > 0.0, "Borrowed displacement recorded: \(engine.borrowedDx)")
-assertTest(engine.pendingDx == 0.0, "Pending reservoir remained 0 (no reverse jitter): \(engine.pendingDx)")
-
-// 4. Test delayed burst arrival after stall
-// Delayed packet arrives:
-let borrowedBeforeBurst = engine.borrowedDx
-engine.move(dx: 10.0, dy: 0.0, isStrokeStart: false, now: curTime + 1_000_000)
-// The incoming delta should have absorbed borrowedDx:
-assertTest(engine.borrowedDx == 0.0, "Borrowed displacement cleanly absorbed")
-// Pending should be incoming delta minus borrowed displacement
-assertTest(engine.pendingDx > 0.0, "Pending reservoir has absorbed delta: \(engine.pendingDx)")
-
-// 5. Test clean halt on finger stop
-var stopTime = curTime + 50_000_000
-for _ in 1...10 {
-    stopTime += 4_166_667
-    engine.tick(now: stopTime)
+// 3. Test 120Hz ProMotion Streaming (~8.33ms packet interval)
+prePos = engine.cachedX
+for i in 1...4 {
+    curTime += 8_333_333
+    let r = engine.move(dx: 5.0, dy: 0.0, isStrokeStart: false, now: curTime)
+    assertTest(r.shouldPost, "120Hz ProMotion packet #\(i) posted immediately")
+    assertTest(!engine.isTimerArmed, "Timer stays disarmed during 120Hz ProMotion streaming")
 }
-assertTest(abs(engine.pendingDx) < 1e-4 && abs(engine.pendingDy) < 1e-4, "Pending reservoir completely drained to 0.0 on stop")
-assertTest(engine.velX == 0.0 && engine.velY == 0.0, "Velocity cleanly reset to 0.0 on stop (no ice-skating drift)")
+assertTest(engine.cachedX > prePos, "120Hz ProMotion advances smoothly")
 
-// 6. Test flush on click
-engine.pendingDx = 1.5
+// 4. Test Slow Precision Movements (small deltas at 35-50ms intervals)
+prePos = engine.cachedX
+for i in 1...3 {
+    curTime += 40_000_000
+    let r = engine.move(dx: 0.5, dy: 0.0, isStrokeStart: false, now: curTime)
+    assertTest(r.shouldPost, "Precision slow movement #\(i) posted immediately with zero freeze")
+    assertTest(!engine.isTimerArmed, "Timer not needed for precision movement")
+}
+
+// 5. Test Wi-Fi Packet Stall & Burst Pacing
+// Simulate a 45ms Wi-Fi stall where packets stop arriving:
+curTime += 45_000_000
+let postCountBeforeStall = engine.posts.count
+let rDelayed1 = engine.move(dx: 10.0, dy: 0.0, isStrokeStart: false, now: curTime)
+assertTest(rDelayed1.shouldPost, "First delayed packet after stall posts immediately")
+
+// Burst: Packet 2 arrives only 2ms after packet 1 due to Wi-Fi buffer draining
+curTime += 2_000_000
+let rBurst = engine.move(dx: 10.0, dy: 0.0, isStrokeStart: false, now: curTime)
+assertTest(!rBurst.shouldPost, "Burst packet (<8ms gap) is NOT posted immediately (prevents teleport jump)")
+assertTest(engine.isTimerArmed, "Timer is armed to pace out burst smoothly")
+assertTest(engine.pendingDx > 0.0, "Burst delta is safely buffered in pending reservoir: \(engine.pendingDx)")
+
+// Timer fires at 8ms interval from packet 1 post
+var burstPostTime = curTime + 6_000_000 // 8ms after delayed packet 1 post
+let rTick1 = engine.tickPacer(now: burstPostTime)
+assertTest(rTick1.shouldPost, "Timer posted paced burst displacement at exact 8ms cadence")
+
+// If backlog was large, timer smoothly paces out remaining displacement on next 120Hz frame
+if rTick1.rearmDelayMs != nil {
+    burstPostTime += 8_000_000
+    let rTick2 = engine.tickPacer(now: burstPostTime)
+    assertTest(rTick2.shouldPost, "Timer posted remaining backlog on frame 2 at 120Hz")
+}
+assertTest(abs(engine.pendingDx) < 1e-4, "Pending reservoir cleanly drained: \(engine.pendingDx)")
+assertTest(!engine.isTimerArmed, "Timer cleanly disarms and returns to sleep")
+
+// 6. Test Mathematical Conservation (Zero Drift, Zero Overshoot)
+let totalDisplacement = engine.cachedX - 100.0
+assertTest(totalDisplacement > 0.0, "Total movement recorded: \(totalDisplacement)")
+assertTest(abs(engine.pendingDx) < 1e-4 && abs(engine.pendingDy) < 1e-4, "Reservoir exact zero")
+
+// 7. Test Flush on Click
+engine.pendingDx = 3.5
 engine.pendingDy = 2.0
 let target = engine.flush()
 assertTest(engine.pendingDx == 0.0 && engine.pendingDy == 0.0, "Flush clears pending")
-assertTest(abs(target.x - engine.cachedX) < 1e-4, "Flush snapped target matches cached position")
+assertTest(abs(target.x - engine.cachedX) < 1e-4, "Flush snaps to exact destination")
 
-print("🎉 Anti-Jitter Frame-Paced Engine & Dead Reckoning Verification Passed! 🎉\n")
+print("\n🎉 120Hz Frame-Paced Anti-Jitter Engine & Burst Absorption Verification Passed! 🎉\n")

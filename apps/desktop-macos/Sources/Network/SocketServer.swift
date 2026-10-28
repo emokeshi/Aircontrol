@@ -51,7 +51,7 @@ public final class SocketServer: @unchecked Sendable {
         publishBonjour(port: tcpPort)
         isRunning = true
 
-        DiagnosticLogger.shared.log("NET", "SocketServer listening on TCP:\(tcpPort) UDP:\(udpPort) (WMM Voice AC_VO, 240Hz Anti-Jitter Glide active)")
+        DiagnosticLogger.shared.log("NET", "SocketServer listening on TCP:\(tcpPort) UDP:\(udpPort) (WMM Voice AC_VO, 120Hz Frame-Paced Anti-Jitter active)")
 
         SystemController.shared.startWorkspaceMonitoring(
             onAppListChanged: { [weak self] in

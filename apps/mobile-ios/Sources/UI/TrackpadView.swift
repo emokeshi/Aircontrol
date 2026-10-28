@@ -95,7 +95,7 @@ final class TrackpadUIView: UIView {
         let dy = avgDy * sens
 
         let now = ProcessInfo.processInfo.systemUptime
-        let isMicroPause = lastMoveTimestamp > 0 && (now - lastMoveTimestamp) > 0.040
+        let isMicroPause = lastMoveTimestamp > 0 && (now - lastMoveTimestamp) > 0.075
         let strokeStart = isFirstMoveInStroke || isMicroPause
         isFirstMoveInStroke = false
         lastMoveTimestamp = now

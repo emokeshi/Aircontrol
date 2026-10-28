@@ -917,15 +917,15 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
             }
         }
 
-        // Gentle 80ms 802.11 PM=0 Client Radio Keep-Awake Timer:
-        // ONLY transmits when completely idle (no touch motion for > 80ms)
+        // Gentle 120ms 802.11 PM=0 Client Radio Keep-Awake Timer:
+        // ONLY transmits when completely idle (no touch motion for > 120ms)
         // During active finger motion (60-120Hz), zero keep-awake packets are sent!
         let timer = DispatchSource.makeTimerSource(flags: .strict, queue: socketQueue)
-        timer.schedule(deadline: .now() + .milliseconds(80), repeating: .milliseconds(80), leeway: .milliseconds(5))
+        timer.schedule(deadline: .now() + .milliseconds(120), repeating: .milliseconds(120), leeway: .milliseconds(5))
         timer.setEventHandler { [weak self] in
             guard let self = self, self.isConnected else { return }
             let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-            if (now - self.lastUdpTxTimeNs) >= 80_000_000 {
+            if (now - self.lastUdpTxTimeNs) >= 120_000_000 {
                 self.lastUdpTxTimeNs = now
                 let keepAwake = Data([0xA8, 0xFC, 0x00, 0x00])
                 if let primaryUdp = self.getUdpConnection(for: self.hostIP) {
