@@ -1,6 +1,30 @@
 import SwiftUI
 import UIKit
 
+private final class AppIconImageCache: @unchecked Sendable {
+    static let shared = AppIconImageCache()
+    private var cache: [String: UIImage] = [:]
+    private let lock = NSLock()
+
+    func image(for bundleId: String, base64: String?) -> UIImage? {
+        guard let b64 = base64, !b64.isEmpty else { return nil }
+        lock.lock()
+        if let existing = cache[bundleId] {
+            lock.unlock()
+            return existing
+        }
+        lock.unlock()
+
+        guard let data = Data(base64Encoded: b64),
+              let img = UIImage(data: data) else { return nil }
+
+        lock.lock()
+        cache[bundleId] = img
+        lock.unlock()
+        return img
+    }
+}
+
 public struct DockView: View {
     @ObservedObject var client = MultipeerClient.shared
 
@@ -19,14 +43,14 @@ public struct DockView: View {
                 .background(AppTheme.border)
 
             if client.dockApps.isEmpty {
-                VStack {
+                VStack(spacing: 8) {
                     Spacer()
-                    Text(client.isConnected ? "暂无运行中的应用" : "未连接")
+                    Text(client.isConnected ? "正在同步程序..." : "未连接")
                         .font(.system(size: 13))
                         .foregroundColor(AppTheme.textSecondary)
                     Spacer()
                 }
-                .frame(height: 190)
+                .frame(height: 195)
                 .frame(maxWidth: .infinity)
                 .background(AppTheme.surface)
             } else {
@@ -39,9 +63,7 @@ public struct DockView: View {
                             } label: {
                                 VStack(spacing: 5) {
                                     ZStack(alignment: .bottom) {
-                                        if let iconStr = app.iconBase64,
-                                           let data = Data(base64Encoded: iconStr),
-                                           let uiImage = UIImage(data: data) {
+                                        if let uiImage = AppIconImageCache.shared.image(for: app.bundleId, base64: app.iconBase64) {
                                             Image(uiImage: uiImage)
                                                 .resizable()
                                                 .aspectRatio(contentMode: .fit)
@@ -89,6 +111,11 @@ public struct DockView: View {
                 }
                 .frame(height: 195)
                 .background(AppTheme.surface)
+            }
+        }
+        .onAppear {
+            if client.isConnected && client.dockApps.isEmpty {
+                client.requestDock()
             }
         }
     }

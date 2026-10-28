@@ -15,6 +15,13 @@ public final class SocketServer: @unchecked Sendable {
     public var tcpPort: UInt16 = 8921
     public var udpPort: UInt16 = 8920
 
+    public var hasActiveTcpClient: Bool {
+        return activeTcpConnection != nil
+    }
+
+    private var lastProcessedSeq: UInt16 = 0
+    private var hasProcessedSeq: Bool = false
+
     private init() {}
 
     public func start(tcpPort: UInt16 = 8921, udpPort: UInt16 = 8920) {
@@ -27,10 +34,18 @@ public final class SocketServer: @unchecked Sendable {
         publishBonjour(port: tcpPort)
         isRunning = true
 
-        SystemController.shared.startWorkspaceMonitoring { [weak self] in
-            self?.broadcastDockApps()
-            MultipeerServer.shared.broadcastDockApps()
-        }
+        DiagnosticLogger.shared.log("NET", "SocketServer listening on TCP:\(tcpPort) UDP:\(udpPort)")
+
+        SystemController.shared.startWorkspaceMonitoring(
+            onAppListChanged: { [weak self] in
+                self?.broadcastDockApps()
+                MultipeerServer.shared.broadcastDockApps()
+            },
+            onActiveAppChanged: { [weak self] activeBundleId in
+                self?.broadcastActiveApp(bundleId: activeBundleId)
+                MultipeerServer.shared.broadcastActiveApp(bundleId: activeBundleId)
+            }
+        )
     }
 
     public func stop() {
@@ -56,7 +71,6 @@ public final class SocketServer: @unchecked Sendable {
     private func startUdp(port: UInt16) {
         let params = NWParameters.udp
         params.allowLocalEndpointReuse = true
-        // 802.11e WMM Voice/Video QoS priority (bypasses Wi-Fi frame aggregation buffer)
         params.serviceClass = .interactiveVideo
 
         guard let listener = try? NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!) else { return }
@@ -72,12 +86,23 @@ public final class SocketServer: @unchecked Sendable {
         connection.start(queue: queue)
         func receiveNext() {
             connection.receiveMessage { [weak self, weak connection] content, _, _, error in
-                guard let self = self, let data = content, error == nil else {
+                guard let self = self, let connection = connection, let data = content, error == nil else {
                     connection?.cancel()
                     return
                 }
                 if data.count >= 16 && data[0] == 0xA8 {
-                    self.processMotionPacket(data)
+                    let eventType = data[1]
+                    if eventType == 0xFE {
+                        // Active UDP Echo Probe: immediately echo back 0xA8 0xFF with identical payload
+                        var reply = data
+                        reply[1] = 0xFF
+                        connection.send(content: reply, completion: .idempotent)
+                        if self.activeTcpConnection != nil {
+                            MultipeerServer.shared.suspendForDirectSocket()
+                        }
+                    } else {
+                        self.processMotionPacket(data, isUdp: true)
+                    }
                 }
                 receiveNext()
             }
@@ -85,11 +110,23 @@ public final class SocketServer: @unchecked Sendable {
         receiveNext()
     }
 
-    public func processMotionPacket(_ data: Data) {
+    public func processMotionPacket(_ data: Data, isUdp: Bool = true) {
         data.withUnsafeBytes { raw in
             guard let ptr = raw.baseAddress else { return }
 
             let eventType = ptr.load(fromByteOffset: 1, as: UInt8.self)
+            let rawSeq = ptr.load(fromByteOffset: 2, as: UInt16.self)
+            let seq = UInt16(bigEndian: rawSeq)
+
+            // Deduplicate if the same sequence number arrived twice during channel switch
+            if hasProcessedSeq && seq == lastProcessedSeq && eventType <= 0x03 {
+                return
+            }
+            lastProcessedSeq = seq
+            hasProcessedSeq = true
+
+            DiagnosticLogger.shared.recordMotionRx(isUdp: isUdp, seq: seq)
+
             let rawDx = ptr.load(fromByteOffset: 4, as: UInt32.self)
             let rawDy = ptr.load(fromByteOffset: 8, as: UInt32.self)
             let dx = Float(bitPattern: UInt32(bigEndian: rawDx))
@@ -144,12 +181,39 @@ public final class SocketServer: @unchecked Sendable {
     }
 
     private func handleTcpConnection(_ connection: NWConnection) {
+        activeTcpConnection?.cancel()
         activeTcpConnection = connection
+
+        connection.stateUpdateHandler = { [weak self, weak connection] state in
+            guard let self = self else { return }
+            switch state {
+            case .ready:
+                DiagnosticLogger.shared.log("TCP", "Direct TCP client connected: \(String(describing: connection?.endpoint))")
+            case .failed(let err):
+                DiagnosticLogger.shared.log("TCP", "Direct TCP failed: \(err.localizedDescription)")
+                if self.activeTcpConnection === connection {
+                    self.activeTcpConnection = nil
+                    MultipeerServer.shared.resumeAdvertisingIfNeeded()
+                }
+            case .cancelled:
+                if self.activeTcpConnection === connection {
+                    self.activeTcpConnection = nil
+                    MultipeerServer.shared.resumeAdvertisingIfNeeded()
+                }
+            default:
+                break
+            }
+        }
+
         connection.start(queue: queue)
 
         func readMessage() {
             connection.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self, weak connection] lengthData, _, _, error in
                 guard let self = self, let connection = connection, let lenBytes = lengthData, lenBytes.count == 4, error == nil else {
+                    if self?.activeTcpConnection === connection {
+                        self?.activeTcpConnection = nil
+                        MultipeerServer.shared.resumeAdvertisingIfNeeded()
+                    }
                     connection?.cancel()
                     return
                 }
@@ -190,21 +254,32 @@ public final class SocketServer: @unchecked Sendable {
 
     public func broadcastDockApps() {
         guard let conn = activeTcpConnection else { return }
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        DispatchQueue.global(qos: .userInteractive).async { [weak self] in
             guard let self = self else { return }
-            let apps = SystemController.shared.getRunningApplications()
+            // Send lightweight metadata first (< 800 bytes) so app list appears in < 5ms
+            let apps = SystemController.shared.getRunningApplications(includeIcons: false)
             let appDicts: [[String: Any]] = apps.map { app in
-                var d: [String: Any] = [
+                [
                     "bundle_id": app.bundleId,
                     "name": app.name,
                     "is_active": app.isActive
                 ]
-                if let icon = app.iconBase64 {
-                    d["icon_base64"] = icon
-                }
-                return d
             }
             self.sendTcpJson(["type": "dock_list", "apps": appDicts], connection: conn)
+        }
+    }
+
+    public func broadcastActiveApp(bundleId: String) {
+        guard let conn = activeTcpConnection else { return }
+        sendTcpJson(["type": "dock_active", "bundle_id": bundleId], connection: conn)
+    }
+
+    private func pushDockIcons(for bundleIds: [String], connection: NWConnection) {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self = self else { return }
+            let icons = SystemController.shared.getCompressedIcons(for: bundleIds)
+            guard !icons.isEmpty else { return }
+            self.sendTcpJson(["type": "dock_icons", "icons": icons], connection: connection)
         }
     }
 
@@ -215,14 +290,18 @@ public final class SocketServer: @unchecked Sendable {
                 DispatchQueue.main.async {
                     AppState.shared.connectedClient = clientName
                 }
+                DiagnosticLogger.shared.log("TCP", "Handshake from '\(clientName)'")
             }
+            AppState.shared.refreshLocalIP()
             sendTcpJson([
                 "type": "host_ack",
                 "status": "authenticated",
                 "host_name": Host.current().localizedName ?? "Mac",
                 "os": "macOS",
                 "udp_port": Int(udpPort),
+                "tcp_port": Int(tcpPort),
                 "local_ip": AppState.shared.localIP,
+                "local_ips": AppState.shared.localIPs,
                 "mac_address": AppState.shared.macAddress,
                 "volume": Double(SystemController.shared.getMasterVolume()),
                 "natural_scroll": InputSimulator.shared.isNaturalScroll,
@@ -289,6 +368,11 @@ public final class SocketServer: @unchecked Sendable {
         case "dock_get":
             broadcastDockApps()
 
+        case "dock_icons_get":
+            if let ids = json["bundle_ids"] as? [String], !ids.isEmpty {
+                pushDockIcons(for: ids, connection: connection)
+            }
+
         case "app_activate":
             if let bundleId = json["bundle_id"] as? String {
                 DispatchQueue.main.async {
@@ -321,6 +405,13 @@ public final class SocketServer: @unchecked Sendable {
                     break
                 }
             }
+
+        case "host_logs_get":
+            sendTcpJson([
+                "type": "host_logs_reply",
+                "summary": DiagnosticLogger.shared.statusSummary(),
+                "lines": DiagnosticLogger.shared.recentLines(limit: 250)
+            ], connection: connection)
 
         default:
             break

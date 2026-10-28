@@ -13,6 +13,7 @@ public struct SystemDeckView: View {
 
     @State private var showingMacEditor: Bool = false
     @State private var editableMac: String = ""
+    @State private var showingLogSheet: Bool = false
 
     private let haptic = UIImpactFeedbackGenerator(style: .light)
     private let notificationHaptic = UINotificationFeedbackGenerator()
@@ -86,8 +87,8 @@ public struct SystemDeckView: View {
                         .frame(width: 36, alignment: .trailing)
                 }
 
-                // Natural Scroll & Wake MAC
-                HStack {
+                // Natural Scroll & Diagnostic Log Button
+                HStack(spacing: 12) {
                     Toggle(
                         "自然滚动",
                         isOn: Binding(
@@ -98,6 +99,25 @@ public struct SystemDeckView: View {
                     .font(.system(size: 13))
                     .foregroundColor(AppTheme.textPrimary)
                     .tint(AppTheme.accent)
+
+                    Button {
+                        haptic.impactOccurred()
+                        client.requestHostLogs()
+                        showingLogSheet = true
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "doc.text")
+                                .font(.system(size: 12))
+                            Text("日志导出")
+                                .font(.system(size: 12, weight: .medium))
+                        }
+                        .foregroundColor(AppTheme.accent)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(AppTheme.surfaceElevated)
+                        .cornerRadius(8)
+                    }
+                    .buttonStyle(.plain)
                 }
 
                 // Compact Power Action Bar
@@ -150,6 +170,143 @@ public struct SystemDeckView: View {
                     UserDefaults.standard.set(newMac, forKey: "aircontrol_saved_mac")
                 }
             )
+        }
+        .sheet(isPresented: $showingLogSheet) {
+            DiagnosticLogSheet()
+        }
+    }
+}
+
+struct DiagnosticLogSheet: View {
+    @ObservedObject var logger = DiagnosticLogger.shared
+    @ObservedObject var client = MultipeerClient.shared
+    @Environment(\.dismiss) var dismiss
+    @State private var copiedToast: Bool = false
+
+    private func shareLogFile() {
+        guard let url = logger.writeExportFile() else { return }
+        let av = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        if let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+           let root = scene.windows.first?.rootViewController {
+            var top = root
+            while let presented = top.presentedViewController {
+                top = presented
+            }
+            if let pop = av.popoverPresentationController {
+                pop.sourceView = top.view
+                pop.sourceRect = CGRect(x: top.view.bounds.midX, y: top.view.bounds.midY, width: 0, height: 0)
+            }
+            top.present(av, animated: true)
+        }
+    }
+
+    var body: some View {
+        NavigationView {
+            VStack(spacing: 0) {
+                // Live Connection Telemetry Summary Header
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("移动通道: \(client.activeMotionChannelName)")
+                            .font(.system(size: 12, weight: .medium, design: .monospaced))
+                            .foregroundColor(AppTheme.textPrimary)
+                        Spacer()
+                        Text("延迟: \(client.latencyMs)ms")
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundColor(AppTheme.textSecondary)
+                    }
+                    HStack {
+                        Text("控制通道: \(client.activeControlChannelName)")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(AppTheme.textSecondary)
+                        Spacer()
+                        Text("程序同步: \(logger.lastDockSyncMs)ms")
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundColor(AppTheme.textSecondary)
+                    }
+                }
+                .padding(12)
+                .background(AppTheme.surfaceElevated)
+
+                Divider()
+
+                // Scrollable Monospaced Log View
+                ScrollView {
+                    Text(logger.buildExportText())
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(AppTheme.textPrimary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(12)
+                        .textSelection(.enabled)
+                }
+                .background(Color.white)
+
+                Divider()
+
+                // Action Bar
+                HStack(spacing: 10) {
+                    Button {
+                        UIPasteboard.general.string = logger.buildExportText()
+                        UINotificationFeedbackGenerator().notificationOccurred(.success)
+                        copiedToast = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) {
+                            copiedToast = false
+                        }
+                    } label: {
+                        Text(copiedToast ? "已复制全部日志" : "复制日志")
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundColor(.white)
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 40)
+                            .background(AppTheme.accent)
+                            .cornerRadius(10)
+                    }
+                    .buttonStyle(.plain)
+
+                    Button {
+                        shareLogFile()
+                    } label: {
+                        Text("导出文件")
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundColor(AppTheme.textPrimary)
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 40)
+                            .background(AppTheme.surfaceElevated)
+                            .cornerRadius(10)
+                    }
+                    .buttonStyle(.plain)
+
+                    Button {
+                        logger.clear()
+                    } label: {
+                        Text("清空")
+                            .font(.system(size: 13))
+                            .foregroundColor(.red)
+                            .frame(width: 56, height: 40)
+                            .background(AppTheme.surfaceElevated)
+                            .cornerRadius(10)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(12)
+                .background(AppTheme.surface)
+            }
+            .navigationTitle("运行日志")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("刷新") {
+                        client.requestHostLogs()
+                    }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("完成") {
+                        dismiss()
+                    }
+                }
+            }
+            .onAppear {
+                client.requestHostLogs()
+            }
         }
     }
 }

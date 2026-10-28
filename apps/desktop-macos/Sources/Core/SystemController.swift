@@ -39,19 +39,30 @@ public final class SystemController: @unchecked Sendable {
 
     // MARK: - Real-Time Workspace App Change Observer
 
-    public func startWorkspaceMonitoring(onUpdate: @escaping () -> Void) {
+    public func startWorkspaceMonitoring(
+        onAppListChanged: @escaping () -> Void,
+        onActiveAppChanged: @escaping (String) -> Void
+    ) {
         guard !workspaceObserversSetup else { return }
         workspaceObserversSetup = true
 
         let nc = NSWorkspace.shared.notificationCenter
-        let notifications: [NSNotification.Name] = [
-            NSWorkspace.didActivateApplicationNotification,
+        let listNotifications: [NSNotification.Name] = [
             NSWorkspace.didLaunchApplicationNotification,
             NSWorkspace.didTerminateApplicationNotification
         ]
-        for name in notifications {
+        for name in listNotifications {
             nc.addObserver(forName: name, object: nil, queue: .main) { _ in
-                onUpdate()
+                onAppListChanged()
+            }
+        }
+
+        nc.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { note in
+            if let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+               let bundleId = app.bundleIdentifier {
+                onActiveAppChanged(bundleId)
+            } else if let frontId = NSWorkspace.shared.frontmostApplication?.bundleIdentifier {
+                onActiveAppChanged(frontId)
             }
         }
     }
@@ -224,7 +235,7 @@ public final class SystemController: @unchecked Sendable {
         }
     }
 
-    public func getRunningApplications() -> [AppSummary] {
+    public func getRunningApplications(includeIcons: Bool = false) -> [AppSummary] {
         let ws = NSWorkspace.shared
         let activeApp = ws.frontmostApplication
 
@@ -234,22 +245,9 @@ public final class SystemController: @unchecked Sendable {
                 guard let bundleId = app.bundleIdentifier,
                       let name = app.localizedName else { return nil }
 
-                cacheLock.lock()
-                var iconString = iconCache[bundleId]
-                cacheLock.unlock()
-
-                if iconString == nil, let icon = app.icon {
-                    let copy = (icon.copy() as? NSImage) ?? icon
-                    copy.size = NSSize(width: 56, height: 56)
-                    if let tiffData = copy.tiffRepresentation,
-                       let bitmap = NSBitmapImageRep(data: tiffData),
-                       let pngData = bitmap.representation(using: .png, properties: [:]) {
-                        let encoded = pngData.base64EncodedString()
-                        iconString = encoded
-                        cacheLock.lock()
-                        iconCache[bundleId] = encoded
-                        cacheLock.unlock()
-                    }
+                var iconString: String? = nil
+                if includeIcons {
+                    iconString = encodeIconIfNeeded(for: app, bundleId: bundleId)
                 }
 
                 return AppSummary(
@@ -259,6 +257,52 @@ public final class SystemController: @unchecked Sendable {
                     iconBase64: iconString
                 )
             }
+    }
+
+    public func getCompressedIcons(for bundleIds: [String]) -> [String: String] {
+        let wanted = Set(bundleIds)
+        var result: [String: String] = [:]
+        let apps = NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular }
+        for app in apps {
+            guard let bid = app.bundleIdentifier, wanted.contains(bid) else { continue }
+            if let encoded = encodeIconIfNeeded(for: app, bundleId: bid) {
+                result[bid] = encoded
+            }
+        }
+        return result
+    }
+
+    private func encodeIconIfNeeded(for app: NSRunningApplication, bundleId: String) -> String? {
+        cacheLock.lock()
+        if let cached = iconCache[bundleId] {
+            cacheLock.unlock()
+            return cached
+        }
+        cacheLock.unlock()
+
+        guard let icon = app.icon else { return nil }
+        let targetSize = NSSize(width: 40, height: 40)
+        let smallImage = NSImage(size: targetSize)
+        smallImage.lockFocus()
+        NSColor.white.setFill()
+        NSBezierPath.fill(NSRect(origin: .zero, size: targetSize))
+        icon.draw(in: NSRect(origin: .zero, size: targetSize),
+                  from: NSRect(origin: .zero, size: icon.size),
+                  operation: .sourceOver,
+                  fraction: 1.0)
+        smallImage.unlockFocus()
+
+        guard let tiffData = smallImage.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiffData),
+              let jpegData = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.72]) else {
+            return nil
+        }
+
+        let encoded = jpegData.base64EncodedString()
+        cacheLock.lock()
+        iconCache[bundleId] = encoded
+        cacheLock.unlock()
+        return encoded
     }
 
     public func activateApplication(bundleId: String) {
