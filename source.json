@@ -15,7 +15,8 @@
       "localizedDescription": "AirControl 是一款专为 Mac 设计的极简无线遥控与触控板应用。采用高帧率触控采样与平滑加速度算法，提供丝滑精准的光标控制、程序坞管理、多媒体快捷控制与局域网远程开机功能。",
       "iconURL": "https://raw.githubusercontent.com/emokeshi/Aircontrol/main/apps/mobile-ios/AppIcon.png",
       "tintColor": "007AFF",
-      "size": 266000,
+      "size": 435100,
+      "sha256": "bd2b8452a641302a05b554b22e846eb70f30a0bf27eecd5016e5a803fee9e236",
       "screenshotURLs": []
     }
   ],
