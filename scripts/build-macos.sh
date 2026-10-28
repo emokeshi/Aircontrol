@@ -56,9 +56,9 @@ cat << 'EOF' > "${CONTENTS_DIR}/Info.plist"
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.3.3</string>
+    <string>1.3.4</string>
     <key>CFBundleVersion</key>
-    <string>7</string>
+    <string>8</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>LSMinimumSystemVersion</key>
@@ -85,8 +85,8 @@ EOF
 echo "==> Performing ad-hoc codesigning on AirControl.app..."
 dot_clean "${APP_DIR}" || true
 xattr -cr "${APP_DIR}" || true
-xattr -d com.apple.FinderInfo "${APP_DIR}" 2>/dev/null || true
-xattr -d "com.apple.fileprovider.fpfs#P" "${APP_DIR}" 2>/dev/null || true
+xattr -r -d com.apple.FinderInfo "${APP_DIR}" 2>/dev/null || true
+xattr -r -d "com.apple.fileprovider.fpfs#P" "${APP_DIR}" 2>/dev/null || true
 codesign --force --deep --sign - "${APP_DIR}"
 
 echo "==> Packaging macOS artifacts into dist/..."

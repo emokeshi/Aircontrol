@@ -3,8 +3,9 @@ import CoreGraphics
 import AppKit
 import os
 
-/// Ultra-Low-Latency Direct Input Engine for macOS
-/// Executes CGEventPost synchronously on the dedicated motion thread in ~40 microseconds with zero WindowServer lock contention.
+/// Ultra-Smooth Anti-Jitter Frame-Paced Input Engine for macOS
+/// Absorbs Wi-Fi packet jitter and micro-bursts with 240Hz frame-paced glide interpolation
+/// and dead-reckoning extrapolation during packet gaps, with zero lag on stroke start.
 public final class InputSimulator: @unchecked Sendable {
     public static let shared = InputSimulator()
 
@@ -15,6 +16,18 @@ public final class InputSimulator: @unchecked Sendable {
     private var cachedY: Double = 0.0
     private var hasValidCache: Bool = false
     private var lastActivityTimestamp: UInt64 = 0
+
+    // 240Hz Anti-Jitter Glide Reservoir & Velocity State
+    private var pendingDx: Double = 0.0
+    private var pendingDy: Double = 0.0
+    private var borrowedDx: Double = 0.0
+    private var borrowedDy: Double = 0.0
+    private var velX: Double = 0.0 // in pixels / ms
+    private var velY: Double = 0.0 // in pixels / ms
+    private var lastPacketTimestamp: UInt64 = 0
+    private var lastTickTimestamp: UInt64 = 0
+    private let glideQueue = DispatchQueue(label: "com.aircontrol.input.glide", qos: .userInteractive)
+    private var glideTimer: DispatchSourceTimer?
 
     // Sub-pixel scroll remainder tracking
     private var scrollRemX: Double = 0.0
@@ -48,19 +61,142 @@ public final class InputSimulator: @unchecked Sendable {
         } else {
             self.isNaturalScroll = true
         }
+
+        startGlideInterpolator()
+    }
+
+    // MARK: - 240Hz Anti-Jitter Frame-Paced Interpolator & Dead-Reckoning
+
+    private func startGlideInterpolator() {
+        let timer = DispatchSource.makeTimerSource(flags: .strict, queue: glideQueue)
+        // 240Hz pacing: fires every 4.16ms (240fps) to synchronize with 60Hz and 120Hz displays
+        timer.schedule(deadline: .now() + .milliseconds(4), repeating: .nanoseconds(4_166_667), leeway: .microseconds(200))
+        timer.setEventHandler { [weak self] in
+            self?.tickGlideInterpolator()
+        }
+        timer.resume()
+        self.glideTimer = timer
+    }
+
+    private func tickGlideInterpolator() {
+        var target: CGPoint = .zero
+        var dragActive = false
+        var shouldPost = false
+
+        os_unfair_lock_lock(&lock)
+        let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        let dtMs: Double
+        if lastTickTimestamp > 0 {
+            dtMs = min(max(Double(now - lastTickTimestamp) / 1_000_000.0, 1.5), 12.0)
+        } else {
+            dtMs = 4.16
+        }
+        lastTickTimestamp = now
+
+        let sinceLastPacketMs = lastPacketTimestamp > 0 ? (Double(now - lastPacketTimestamp) / 1_000_000.0) : 1000.0
+        let pendingMag = hypot(pendingDx, pendingDy)
+
+        var stepX: Double = 0.0
+        var stepY: Double = 0.0
+
+        if pendingMag > 0.05 {
+            // Case A: Discharging pending displacement reservoir
+            if pendingMag < 0.6 {
+                // Nearly finished or stopping: drain 100% to snap crisp stop
+                stepX = pendingDx
+                stepY = pendingDy
+                pendingDx = 0.0
+                pendingDy = 0.0
+            } else {
+                // Active glide: drain ~40% per 4ms tick (smoothly distributes over 12-16ms)
+                let drainRatio = min(0.60, max(0.35, 1.0 / (16.0 / dtMs)))
+                stepX = pendingDx * drainRatio
+                stepY = pendingDy * drainRatio
+                pendingDx -= stepX
+                pendingDy -= stepY
+            }
+        } else if sinceLastPacketMs < 35.0 && (abs(velX) > 0.02 || abs(velY) > 0.02) {
+            // Case B: Wi-Fi packet stall (16ms..35ms gap)!
+            // Dead-reckoning: maintain cursor motion at decayed hand velocity so display frame never freezes.
+            let decay = max(0.0, 1.0 - (sinceLastPacketMs - 16.0) / 19.0)
+            stepX = velX * dtMs * decay * 0.50
+            stepY = velY * dtMs * decay * 0.50
+            // Record borrowed displacement so when delayed packets arrive, no double-displacement jump occurs
+            borrowedDx += stepX
+            borrowedDy += stepY
+        } else {
+            // Case C: Idle / Stationary
+            velX = 0.0
+            velY = 0.0
+            pendingDx = 0.0
+            pendingDy = 0.0
+            borrowedDx = 0.0
+            borrowedDy = 0.0
+        }
+
+        let stepMag = hypot(stepX, stepY)
+        if stepMag > 0.02 {
+            let rawTarget = CGPoint(x: cachedX + stepX, y: cachedY + stepY)
+            target = snapToDisplayBoundsLocked(rawTarget)
+            cachedX = target.x
+            cachedY = target.y
+            dragActive = isDragging
+            shouldPost = true
+        }
+        os_unfair_lock_unlock(&lock)
+
+        guard shouldPost else { return }
+        postPointerEvent(at: target, isDragging: dragActive, coalesced: true)
+    }
+
+    private func flushPendingLocked() -> CGPoint {
+        if abs(pendingDx) > 0.01 || abs(pendingDy) > 0.01 {
+            let rawTarget = CGPoint(x: cachedX + pendingDx, y: cachedY + pendingDy)
+            let snapped = snapToDisplayBoundsLocked(rawTarget)
+            cachedX = snapped.x
+            cachedY = snapped.y
+            pendingDx = 0.0
+            pendingDy = 0.0
+            velX = 0.0
+            velY = 0.0
+            borrowedDx = 0.0
+            borrowedDy = 0.0
+        }
+        return CGPoint(x: cachedX, y: cachedY)
+    }
+
+    private func postPointerEvent(at target: CGPoint, isDragging dragActive: Bool, coalesced: Bool) {
+        let t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        let eventType: CGEventType = dragActive ? .leftMouseDragged : .mouseMoved
+        if let event = CGEvent(
+            mouseEventSource: nil,
+            mouseType: eventType,
+            mouseCursorPosition: target,
+            mouseButton: .left
+        ) {
+            event.post(tap: .cgSessionEventTap)
+        }
+        let dtUs = Double(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1_000.0
+        DiagnosticLogger.shared.recordCgEventPost(durationUs: dtUs, coalesced: coalesced)
     }
 
     // MARK: - Cursor Synchronization & Display Bounds
 
     private func syncCursorPositionIfNeededLocked(now: UInt64) {
-        let elapsedNs = lastActivityTimestamp > 0 ? (now - lastActivityTimestamp) : 250_000_000
-        if !hasValidCache || elapsedNs >= 250_000_000 {
+        let elapsedNs = lastActivityTimestamp > 0 ? (now - lastActivityTimestamp) : 200_000_000
+        if !hasValidCache || elapsedNs >= 200_000_000 {
             if let sysLoc = CGEvent(source: nil)?.location {
                 cachedX = sysLoc.x
                 cachedY = sysLoc.y
             }
             hasValidCache = true
-            lastAccel = 1.0
+            lastAccel = Self.baseMultiplier * sensitivity
+            pendingDx = 0.0
+            pendingDy = 0.0
+            velX = 0.0
+            velY = 0.0
+            borrowedDx = 0.0
+            borrowedDy = 0.0
         }
         lastActivityTimestamp = now
     }
@@ -90,10 +226,14 @@ public final class InputSimulator: @unchecked Sendable {
         return CGPoint(x: clampedX, y: clampedY)
     }
 
-    // MARK: - Zero-Latency Direct Pointer Movement (0x01: Pure Move, Never Drags)
+    // MARK: - Pointer Movement with Zero-Latency Stroke Start & 240Hz Anti-Jitter
 
-    public func move(dx: Float, dy: Float) {
+    public func move(dx: Float, dy: Float, isStrokeStart: Bool = false) {
         guard dx != 0 || dy != 0 else { return }
+
+        var immediateTarget: CGPoint = .zero
+        var shouldPostImmediate = false
+        var dragActive = false
 
         os_unfair_lock_lock(&lock)
         let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
@@ -103,58 +243,91 @@ public final class InputSimulator: @unchecked Sendable {
         let baseGain = Self.baseMultiplier * sensitivity
         let rawAccel = baseGain * (1.0 + min(dist * 0.10, 1.8))
 
-        let accel = lastAccel + 0.45 * (rawAccel - lastAccel)
-        lastAccel = accel
+        let isFreshStroke = isStrokeStart || lastPacketTimestamp == 0 || (now - lastPacketTimestamp) > 40_000_000
+        if isFreshStroke {
+            lastAccel = baseGain
+        } else {
+            lastAccel = lastAccel + 0.35 * (rawAccel - lastAccel)
+        }
+        let accel = lastAccel
 
-        let rawTarget = CGPoint(x: cachedX + Double(dx * accel), y: cachedY + Double(dy * accel))
-        let target = snapToDisplayBoundsLocked(rawTarget)
-        cachedX = target.x
-        cachedY = target.y
-        let dragActive = isDragging
+        let deltaX = Double(dx * accel)
+        let deltaY = Double(dy * accel)
+
+        let dtPacket = lastPacketTimestamp > 0 ? min(Double(now - lastPacketTimestamp) / 1_000_000.0, 35.0) : 16.67
+        if dtPacket > 1.0 {
+            let vx = deltaX / dtPacket
+            let vy = deltaY / dtPacket
+            if isFreshStroke {
+                velX = vx
+                velY = vy
+            } else {
+                velX = velX * 0.60 + vx * 0.40
+                velY = velY * 0.60 + vy * 0.40
+            }
+        }
+
+        if isFreshStroke {
+            // Immediate response on stroke start: step 75% instantly for 0.0ms perceived latency
+            let stepX = deltaX * 0.75
+            let stepY = deltaY * 0.75
+            pendingDx = deltaX - stepX
+            pendingDy = deltaY - stepY
+            borrowedDx = 0.0
+            borrowedDy = 0.0
+
+            let rawTarget = CGPoint(x: cachedX + stepX, y: cachedY + stepY)
+            immediateTarget = snapToDisplayBoundsLocked(rawTarget)
+            cachedX = immediateTarget.x
+            cachedY = immediateTarget.y
+            dragActive = isDragging
+            shouldPostImmediate = true
+        } else {
+            var finalDeltaX = deltaX
+            var finalDeltaY = deltaY
+            // Deduct extrapolated movement already rendered during packet stall to avoid jumps
+            if borrowedDx != 0.0 {
+                if (finalDeltaX > 0 && borrowedDx > 0) || (finalDeltaX < 0 && borrowedDx < 0) {
+                    let absorb = (finalDeltaX > 0) ? min(finalDeltaX, borrowedDx) : max(finalDeltaX, borrowedDx)
+                    finalDeltaX -= absorb
+                    borrowedDx -= absorb
+                } else {
+                    borrowedDx = 0.0
+                }
+            }
+            if borrowedDy != 0.0 {
+                if (finalDeltaY > 0 && borrowedDy > 0) || (finalDeltaY < 0 && borrowedDy < 0) {
+                    let absorb = (finalDeltaY > 0) ? min(finalDeltaY, borrowedDy) : max(finalDeltaY, borrowedDy)
+                    finalDeltaY -= absorb
+                    borrowedDy -= absorb
+                } else {
+                    borrowedDy = 0.0
+                }
+            }
+            pendingDx += finalDeltaX
+            pendingDy += finalDeltaY
+        }
+
+        lastPacketTimestamp = now
         os_unfair_lock_unlock(&lock)
 
-        let t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-        let eventType: CGEventType = dragActive ? .leftMouseDragged : .mouseMoved
-        if let event = CGEvent(
-            mouseEventSource: nil,
-            mouseType: eventType,
-            mouseCursorPosition: target,
-            mouseButton: .left
-        ) {
-            event.post(tap: .cgSessionEventTap)
+        if shouldPostImmediate {
+            postPointerEvent(at: immediateTarget, isDragging: dragActive, coalesced: false)
         }
-        let dtUs = Double(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1_000.0
-        DiagnosticLogger.shared.recordCgEventPost(durationUs: dtUs, coalesced: false)
     }
 
-    // MARK: - Explicit Drag Movement (0x03: Posts leftMouseDown only once, then leftMouseDragged)
-
-    public func dragMove(dx: Float, dy: Float) {
+    public func dragMove(dx: Float, dy: Float, isStrokeStart: Bool = false) {
         guard dx != 0 || dy != 0 else { return }
 
         var needMouseDown = false
         var downPoint: CGPoint = .zero
 
         os_unfair_lock_lock(&lock)
-        let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-        syncCursorPositionIfNeededLocked(now: now)
-
         if !isDragging {
             isDragging = true
             needMouseDown = true
-            downPoint = CGPoint(x: cachedX, y: cachedY)
+            downPoint = flushPendingLocked()
         }
-
-        let dist = hypotf(dx, dy)
-        let baseGain = Self.baseMultiplier * sensitivity
-        let rawAccel = baseGain * (1.0 + min(dist * 0.10, 1.8))
-        let accel = lastAccel + 0.45 * (rawAccel - lastAccel)
-        lastAccel = accel
-
-        let rawTarget = CGPoint(x: cachedX + Double(dx * accel), y: cachedY + Double(dy * accel))
-        let target = snapToDisplayBoundsLocked(rawTarget)
-        cachedX = target.x
-        cachedY = target.y
         os_unfair_lock_unlock(&lock)
 
         if needMouseDown {
@@ -168,14 +341,7 @@ public final class InputSimulator: @unchecked Sendable {
             }
         }
 
-        if let dragEv = CGEvent(
-            mouseEventSource: nil,
-            mouseType: .leftMouseDragged,
-            mouseCursorPosition: target,
-            mouseButton: .left
-        ) {
-            dragEv.post(tap: .cgSessionEventTap)
-        }
+        move(dx: dx, dy: dy, isStrokeStart: isStrokeStart)
     }
 
     // MARK: - Zero-Latency Scroll
@@ -216,7 +382,7 @@ public final class InputSimulator: @unchecked Sendable {
         os_unfair_lock_lock(&lock)
         let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         syncCursorPositionIfNeededLocked(now: now)
-        targetPoint = CGPoint(x: cachedX, y: cachedY)
+        targetPoint = flushPendingLocked()
         if isDragging != dragging {
             isDragging = dragging
             shouldPost = true
@@ -239,7 +405,7 @@ public final class InputSimulator: @unchecked Sendable {
         os_unfair_lock_lock(&lock)
         let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         syncCursorPositionIfNeededLocked(now: now)
-        let targetPoint = CGPoint(x: cachedX, y: cachedY)
+        let targetPoint = flushPendingLocked()
         isDragging = false
         os_unfair_lock_unlock(&lock)
 
@@ -253,7 +419,7 @@ public final class InputSimulator: @unchecked Sendable {
         os_unfair_lock_lock(&lock)
         let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         syncCursorPositionIfNeededLocked(now: now)
-        let targetPoint = CGPoint(x: cachedX, y: cachedY)
+        let targetPoint = flushPendingLocked()
         isDragging = false
         os_unfair_lock_unlock(&lock)
 
@@ -274,7 +440,7 @@ public final class InputSimulator: @unchecked Sendable {
         os_unfair_lock_lock(&lock)
         let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         syncCursorPositionIfNeededLocked(now: now)
-        let targetPoint = CGPoint(x: cachedX, y: cachedY)
+        let targetPoint = flushPendingLocked()
         isDragging = false
         os_unfair_lock_unlock(&lock)
 

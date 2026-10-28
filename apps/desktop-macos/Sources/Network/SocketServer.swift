@@ -48,11 +48,10 @@ public final class SocketServer: @unchecked Sendable {
 
         startUdp(port: udpPort)
         startTcp(port: tcpPort)
-        startRadioKeepAwakeLoop()
         publishBonjour(port: tcpPort)
         isRunning = true
 
-        DiagnosticLogger.shared.log("NET", "SocketServer listening on TCP:\(tcpPort) UDP:\(udpPort) (15ms PM=0 KeepAwake active, awdl0 disabled)")
+        DiagnosticLogger.shared.log("NET", "SocketServer listening on TCP:\(tcpPort) UDP:\(udpPort) (WMM Voice AC_VO, 240Hz Anti-Jitter Glide active)")
 
         SystemController.shared.startWorkspaceMonitoring(
             onAppListChanged: { [weak self] in
@@ -80,26 +79,6 @@ public final class SocketServer: @unchecked Sendable {
         isRunning = false
     }
 
-    /// Proactive 15ms (66Hz) 802.11 PM=0 Radio Keep-Awake Timer:
-    /// MediaTek `MTK_driverkit-342.6` (0x14C3:0x7932) enters 102.4ms 802.11 Beacon sleep (PM=1) after ~25ms of TX inactivity.
-    /// Transmitting a 4-byte UDP pulse every 15ms while a client is connected locks `en0` in PM=0 (5ms RTT, 0ms sleep) 100% of the time!
-    private func startRadioKeepAwakeLoop() {
-        radioKeepAwakeTimer?.cancel()
-        let timer = DispatchSource.makeTimerSource(flags: .strict, queue: udpQueue)
-        timer.schedule(deadline: .now() + .milliseconds(15), repeating: .milliseconds(15), leeway: .milliseconds(1))
-        timer.setEventHandler { [weak self] in
-            guard let self = self, let udp = self.activeUdpConnection else { return }
-            let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-            if (now - self.lastKeepAwakeReplyNs) >= 13_000_000 {
-                self.lastKeepAwakeReplyNs = now
-                let keepAwake = Data([0xA8, 0xFD, 0x00, 0x00])
-                udp.send(content: keepAwake, completion: .idempotent)
-            }
-        }
-        timer.resume()
-        self.radioKeepAwakeTimer = timer
-    }
-
     private func publishBonjour(port: UInt16) {
         let hostName = Host.current().localizedName ?? "Mac"
         netService = NetService(domain: "", type: "_aircontrol._tcp.", name: hostName, port: Int32(port))
@@ -107,13 +86,13 @@ public final class SocketServer: @unchecked Sendable {
         netService?.publish()
     }
 
-    // MARK: - WMM High-Priority UDP Motion Listener (16-Byte Datagrams)
+    // MARK: - WMM Voice High-Priority UDP Motion Listener (16-Byte Datagrams)
 
     private func startUdp(port: UInt16) {
         let params = NWParameters.udp
         params.allowLocalEndpointReuse = true
         params.includePeerToPeer = false
-        params.serviceClass = .interactiveVideo
+        params.serviceClass = .interactiveVoice
         // Bypass virtual VPN TUN interfaces (utun) which have interface type .other
         params.prohibitedInterfaceTypes = [.other]
 
@@ -142,28 +121,16 @@ public final class SocketServer: @unchecked Sendable {
                 if data.count >= 4 && data[0] == 0xA8 {
                     let eventType = data[1]
                     if eventType == 0xFC {
-                        // Client 15ms idle keep-awake pulse: reply if needed
-                        let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-                        if (now - self.lastKeepAwakeReplyNs) >= 13_000_000 {
-                            self.lastKeepAwakeReplyNs = now
-                            let keepAwake = Data([0xA8, 0xFD, 0x00, 0x00])
-                            connection.send(content: keepAwake, completion: .idempotent)
-                        }
+                        // Client idle keep-awake: radio is active, no reverse collision packet needed
                     } else if data.count >= 16 {
                         if eventType == 0xFE {
-                            // Active UDP Echo Probe: immediately echo back 0xA8 0xFF with identical payload
+                            // Active UDP Echo Probe: echo back 0xA8 0xFF with identical payload for RTT measurement
                             var reply = data
                             reply[1] = 0xFF
-                            self.lastKeepAwakeReplyNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
                             connection.send(content: reply, completion: .idempotent)
                         } else {
+                            // Pure simplex motion processing: NEVER transmit reverse packets during active motion!
                             self.processMotionPacket(data, isUdp: true)
-                            let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-                            if (now - self.lastKeepAwakeReplyNs) >= 13_000_000 {
-                                self.lastKeepAwakeReplyNs = now
-                                let keepAwake = Data([0xA8, 0xFD, data[2], data[3]])
-                                connection.send(content: keepAwake, completion: .idempotent)
-                            }
                         }
                     }
                 }
@@ -241,11 +208,11 @@ public final class SocketServer: @unchecked Sendable {
 
             switch eventType {
             case 0x01:
-                InputSimulator.shared.move(dx: dx, dy: dy)
+                InputSimulator.shared.move(dx: dx, dy: dy, isStrokeStart: isStrokeStart)
             case 0x02:
                 InputSimulator.shared.scroll(dx: dx, dy: dy)
             case 0x03:
-                InputSimulator.shared.dragMove(dx: dx, dy: dy)
+                InputSimulator.shared.dragMove(dx: dx, dy: dy, isStrokeStart: isStrokeStart)
             case 0x04:
                 if flags & 0x08 != 0 {
                     InputSimulator.shared.doubleClick()
@@ -277,7 +244,7 @@ public final class SocketServer: @unchecked Sendable {
         let params = NWParameters(tls: nil, tcp: tcpOptions)
         params.allowLocalEndpointReuse = true
         params.includePeerToPeer = false
-        params.serviceClass = .interactiveVideo
+        params.serviceClass = .interactiveVoice
         params.prohibitedInterfaceTypes = [.other]
 
         guard let listener = try? NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!) else { return }

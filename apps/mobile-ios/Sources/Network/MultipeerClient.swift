@@ -33,6 +33,50 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
     private var resolvingServices: [NetService] = []
     private var tcpConnection: NWConnection?
     private var udpConnections: [String: NWConnection] = [:]
+    private var udpLock = os_unfair_lock()
+
+    private func getUdpConnection(for host: String) -> NWConnection? {
+        os_unfair_lock_lock(&udpLock)
+        defer { os_unfair_lock_unlock(&udpLock) }
+        return udpConnections[host]
+    }
+
+    private func setUdpConnection(_ conn: NWConnection?, for host: String) {
+        os_unfair_lock_lock(&udpLock)
+        if let c = conn {
+            udpConnections[host] = c
+        } else {
+            udpConnections.removeValue(forKey: host)
+        }
+        os_unfair_lock_unlock(&udpLock)
+    }
+
+    private func getAllUdpConnections() -> [NWConnection] {
+        os_unfair_lock_lock(&udpLock)
+        defer { os_unfair_lock_unlock(&udpLock) }
+        return Array(udpConnections.values)
+    }
+
+    private func pruneUdpConnections(keeping validIPs: [String]) {
+        os_unfair_lock_lock(&udpLock)
+        var toCancel: [NWConnection] = []
+        for (ip, conn) in udpConnections where !validIPs.contains(ip) {
+            toCancel.append(conn)
+            udpConnections.removeValue(forKey: ip)
+        }
+        os_unfair_lock_unlock(&udpLock)
+        for conn in toCancel {
+            conn.cancel()
+        }
+    }
+
+    private func removeAllUdpConnections() -> [NWConnection] {
+        os_unfair_lock_lock(&udpLock)
+        let conns = Array(udpConnections.values)
+        udpConnections.removeAll()
+        os_unfair_lock_unlock(&udpLock)
+        return conns
+    }
     private let socketQueue = DispatchQueue(label: "com.aircontrol.client.socket", qos: .userInteractive)
 
     @Published public var isConnected: Bool = false
@@ -206,10 +250,9 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
         session?.disconnect()
         tcpConnection?.cancel()
         tcpConnection = nil
-        for (_, udp) in udpConnections {
+        for udp in removeAllUdpConnections() {
             udp.cancel()
         }
-        udpConnections.removeAll()
         stopPingLoop()
         reconnectTimer?.invalidate()
         reconnectTimer = nil
@@ -253,10 +296,9 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
             DiagnosticLogger.shared.log("SYS", "App entered foreground. Interfaces: \(DiagnosticLogger.describeInterfaces())")
             // Recreate UDP channels on foreground resume in case iOS invalidated backgrounded sockets
             let activeIPs = self.candidateHostIPs
-            for (_, udp) in self.udpConnections {
+            for udp in self.removeAllUdpConnections() {
                 udp.cancel()
             }
-            self.udpConnections.removeAll()
             for ip in activeIPs {
                 self.ensureUdpChannel(host: ip, port: 8920)
             }
@@ -399,14 +441,14 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
 
     private func ensureUdpChannel(host: String, port: UInt16 = 8920) {
         guard Self.isValidLanIP(host) else { return }
-        if udpConnections[host] != nil { return }
+        if getUdpConnection(for: host) != nil { return }
 
         let udpParams = NWParameters.udp
         // Force physical Wi-Fi interface (en0) on iOS, bypassing VPN utun5 (10.7.1.1), Cellular pdp_ip0, and awdl0!
         udpParams.includePeerToPeer = false
         udpParams.requiredInterfaceType = .wifi
         udpParams.prohibitedInterfaceTypes = [.other, .cellular]
-        udpParams.serviceClass = .interactiveVideo
+        udpParams.serviceClass = .interactiveVoice
 
         let udpEndpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!)
         let udp = NWConnection(to: udpEndpoint, using: udpParams)
@@ -416,13 +458,11 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
                 self.receiveUdpEchoLoop(from: udp, host: host)
                 self.sendUdpEchoProbe()
             } else if case .failed = state {
-                DispatchQueue.main.async {
-                    self.udpConnections.removeValue(forKey: host)
-                }
+                self.setUdpConnection(nil, for: host)
             }
         }
         udp.start(queue: socketQueue)
-        self.udpConnections[host] = udp
+        setUdpConnection(udp, for: host)
         DiagnosticLogger.shared.log("UDP", "Initialized Wi-Fi Direct UDP channel to \(host):\(port) (utun bypassed)")
     }
 
@@ -436,7 +476,7 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
             ptr.storeBytes(of: nowMs.bigEndian, toByteOffset: 8, as: UInt64.self)
         }
         self.lastUdpTxTimeNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-        for (_, udp) in udpConnections {
+        for udp in getAllUdpConnections() {
             udp.send(content: probe, completion: .idempotent)
         }
     }
@@ -447,11 +487,11 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
             if let data = content, data.count >= 4, data[0] == 0xA8 {
                 let subType = data[1]
                 if subType == 0xFD {
-                    // 802.11 PM=0 Radio Keep-Awake pulse from Mac during active mouse movement
+                    // 802.11 PM=0 Radio Keep-Awake pulse from Mac
                     DiagnosticLogger.shared.recordKeepAwakePulse()
-                    DispatchQueue.main.async {
-                        self.lastUdpPongTime = ProcessInfo.processInfo.systemUptime
-                        if !self.isUdpVerified {
+                    self.lastUdpPongTime = ProcessInfo.processInfo.systemUptime
+                    if !self.isUdpVerified {
+                        DispatchQueue.main.async {
                             self.isUdpVerified = true
                         }
                     }
@@ -504,7 +544,7 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
         tcpParams.includePeerToPeer = false
         tcpParams.requiredInterfaceType = .wifi
         tcpParams.prohibitedInterfaceTypes = [.other, .cellular]
-        tcpParams.serviceClass = .interactiveVideo
+        tcpParams.serviceClass = .interactiveVoice
 
         let tcpEndpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: tcpPort)!)
         let tcp = NWConnection(to: tcpEndpoint, using: tcpParams)
@@ -616,10 +656,7 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
                     let valid = ips.filter { Self.isValidLanIP($0) }
                     if !valid.isEmpty {
                         // Prune any unplugged/stale Mac IPs (e.g. if wired en3 was unplugged) so we never ARP-spam dead IPs on Wi-Fi
-                        for existingIP in Array(self.udpConnections.keys) where !valid.contains(existingIP) {
-                            self.udpConnections[existingIP]?.cancel()
-                            self.udpConnections.removeValue(forKey: existingIP)
-                        }
+                        self.pruneUdpConnections(keeping: valid)
                         self.candidateHostIPs = valid
                         for ip in valid {
                             self.ensureUdpChannel(host: ip, port: udpPort)
@@ -785,16 +822,19 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
         var sentViaUdp = false
         var sentViaTcp = false
 
-        // 1. Primary: WMM InteractiveVideo (CS4 / AC_VI) UDP to the active host IP (zero TCP ACK reverse-path Wi-Fi collisions!)
+        // 1. Primary: WMM Voice (AC_VO) UDP to the active host IP
         self.lastUdpTxTimeNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-        if let primaryUdp = udpConnections[hostIP] {
+        if let primaryUdp = getUdpConnection(for: hostIP) {
             primaryUdp.send(content: buffer, completion: .idempotent)
             sentViaUdp = true
-        } else if !udpConnections.isEmpty {
-            for (_, udp) in udpConnections {
-                udp.send(content: buffer, completion: .idempotent)
+        } else {
+            let activeConns = getAllUdpConnections()
+            if !activeConns.isEmpty {
+                for udp in activeConns {
+                    udp.send(content: buffer, completion: .idempotent)
+                }
+                sentViaUdp = true
             }
-            sentViaUdp = true
         }
 
         // 2. Fallback: Only send motion over TCP_NODELAY if UDP has not yet been verified!
@@ -877,21 +917,21 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
             }
         }
 
-        // Proactive 15ms (66Hz) 802.11 PM=0 Client Radio Keep-Awake Timer:
-        // Prevents both the iPhone Wi-Fi radio and the Mac's MediaTek MTK_driverkit-342.6 Wi-Fi chip
-        // from entering 102.4ms Beacon sleep (PM=1) during finger pauses!
+        // Gentle 80ms 802.11 PM=0 Client Radio Keep-Awake Timer:
+        // ONLY transmits when completely idle (no touch motion for > 80ms)
+        // During active finger motion (60-120Hz), zero keep-awake packets are sent!
         let timer = DispatchSource.makeTimerSource(flags: .strict, queue: socketQueue)
-        timer.schedule(deadline: .now() + .milliseconds(15), repeating: .milliseconds(15), leeway: .milliseconds(1))
+        timer.schedule(deadline: .now() + .milliseconds(80), repeating: .milliseconds(80), leeway: .milliseconds(5))
         timer.setEventHandler { [weak self] in
             guard let self = self, self.isConnected else { return }
             let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-            if (now - self.lastUdpTxTimeNs) >= 13_000_000 {
+            if (now - self.lastUdpTxTimeNs) >= 80_000_000 {
                 self.lastUdpTxTimeNs = now
                 let keepAwake = Data([0xA8, 0xFC, 0x00, 0x00])
-                if let primaryUdp = self.udpConnections[self.hostIP] {
+                if let primaryUdp = self.getUdpConnection(for: self.hostIP) {
                     primaryUdp.send(content: keepAwake, completion: .idempotent)
                 } else {
-                    for (_, udp) in self.udpConnections {
+                    for udp in self.getAllUdpConnections() {
                         udp.send(content: keepAwake, completion: .idempotent)
                     }
                 }

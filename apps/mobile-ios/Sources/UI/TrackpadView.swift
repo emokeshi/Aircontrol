@@ -24,6 +24,7 @@ final class TrackpadUIView: UIView {
     private var maxTouchCountInStroke: Int = 0
     private var isThreeFingerDragging: Bool = false
     private var isFirstMoveInStroke: Bool = true
+    private var lastMoveTimestamp: TimeInterval = 0
 
     private let lightHaptic = UIImpactFeedbackGenerator(style: .light)
     private let mediumHaptic = UIImpactFeedbackGenerator(style: .medium)
@@ -47,6 +48,7 @@ final class TrackpadUIView: UIView {
             totalPathDistance = 0
             maxTouchCountInStroke = allCount
             isFirstMoveInStroke = true
+            lastMoveTimestamp = 0
         } else {
             maxTouchCountInStroke = max(maxTouchCountInStroke, allCount)
         }
@@ -91,8 +93,12 @@ final class TrackpadUIView: UIView {
         let sens = Float(TrackpadSettings.shared.sensitivity)
         let dx = avgDx * sens
         let dy = avgDy * sens
-        let strokeStart = isFirstMoveInStroke
+
+        let now = ProcessInfo.processInfo.systemUptime
+        let isMicroPause = lastMoveTimestamp > 0 && (now - lastMoveTimestamp) > 0.040
+        let strokeStart = isFirstMoveInStroke || isMicroPause
         isFirstMoveInStroke = false
+        lastMoveTimestamp = now
 
         if fingerCount == 1 {
             // Single finger ONLY moves cursor (never auto-drags unless user is explicitly holding the bottom Left Button)
@@ -122,6 +128,8 @@ final class TrackpadUIView: UIView {
         let remainingTouches = allTouches.subtracting(touches).filter { $0.phase != .ended && $0.phase != .cancelled }
 
         if remainingTouches.isEmpty {
+            lastMoveTimestamp = 0
+            isFirstMoveInStroke = true
             if isThreeFingerDragging {
                 isThreeFingerDragging = false
                 MultipeerClient.shared.sendDragRelease()
@@ -145,6 +153,8 @@ final class TrackpadUIView: UIView {
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        lastMoveTimestamp = 0
+        isFirstMoveInStroke = true
         if isThreeFingerDragging {
             isThreeFingerDragging = false
             MultipeerClient.shared.sendDragRelease()
