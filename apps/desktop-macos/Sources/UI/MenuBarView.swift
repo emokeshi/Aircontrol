@@ -71,6 +71,37 @@ public struct MenuBarView: View {
                         .font(.system(size: 11, weight: .medium, design: .monospaced))
                         .foregroundColor(Color(red: 0.2, green: 0.2, blue: 0.25))
                 }
+
+                Divider()
+
+                HStack {
+                    Button {
+                        if let ipaPath = UpdateServer.shared.findIpaPath() {
+                            let url = URL(fileURLWithPath: ipaPath)
+                            NSWorkspace.shared.activateFileViewerSelecting([url])
+                        }
+                    } label: {
+                        Text("打开 IPA 目录")
+                            .font(.system(size: 11))
+                            .foregroundColor(Color.blue)
+                    }
+                    .buttonStyle(.plain)
+
+                    Spacer()
+
+                    Button {
+                        if let ipaPath = UpdateServer.shared.findIpaPath() {
+                            let url = URL(fileURLWithPath: ipaPath)
+                            let sharingService = NSSharingService(named: .sendViaAirDrop)
+                            sharingService?.perform(withItems: [url])
+                        }
+                    } label: {
+                        Text("隔空投送至手机")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundColor(Color.blue)
+                    }
+                    .buttonStyle(.plain)
+                }
             }
             .padding(12)
             .background(Color(red: 0.98, green: 0.98, blue: 0.99))

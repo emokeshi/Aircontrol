@@ -54,7 +54,7 @@ public final class UpdateServer: @unchecked Sendable {
         }
     }
 
-    private func findIpaPath() -> String? {
+    public func findIpaPath() -> String? {
         let possiblePaths = [
             Bundle.main.bundlePath + "/../../../dist/AirControl.ipa",
             Bundle.main.bundlePath + "/../../dist/AirControl.ipa",
@@ -127,7 +127,7 @@ public final class UpdateServer: @unchecked Sendable {
                         "localizedDescription": "Apple原生对等互联直连、120Hz硬件事件流、纯白极简控制中心",
                         "iconURL": "https://raw.githubusercontent.com/emokeshi/Aircontrol/main/apps/mobile-ios/AppIcon.png",
                         "tintColor": "007AFF",
-                        "size": 216000
+                        "size": 435100
                     ]
                 ]
             ]
