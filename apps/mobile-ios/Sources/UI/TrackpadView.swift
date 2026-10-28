@@ -19,11 +19,10 @@ public final class TrackpadSettings: ObservableObject {
 // MARK: - Hardware-Coalesced UIKit Touch View
 
 final class TrackpadUIView: UIView {
-    private var initialTouchPoint: CGPoint = .zero
     private var touchDownTime: TimeInterval = 0
-    private var lastTapTime: TimeInterval = 0
-    private var hasMovedSignificantly: Bool = false
-    private var isTapDragging: Bool = false
+    private var totalPathDistance: CGFloat = 0
+    private var maxTouchCountInStroke: Int = 0
+    private var isThreeFingerDragging: Bool = false
     private var isFirstMoveInStroke: Bool = true
 
     private let lightHaptic = UIImpactFeedbackGenerator(style: .light)
@@ -41,26 +40,25 @@ final class TrackpadUIView: UIView {
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let touch = touches.first else { return }
-        let now = ProcessInfo.processInfo.systemUptime
-        if event?.allTouches?.count == touches.count {
-            initialTouchPoint = touch.location(in: self)
-            touchDownTime = now
-            hasMovedSignificantly = false
+        let allCount = event?.allTouches?.count ?? touches.count
+        if allCount == touches.count {
+            // Fresh stroke started
+            touchDownTime = ProcessInfo.processInfo.systemUptime
+            totalPathDistance = 0
+            maxTouchCountInStroke = allCount
             isFirstMoveInStroke = true
-
-            // Double-tap and hold to drag (native macOS trackpad gesture)
-            if touches.count == 1 && (now - lastTapTime) < 0.25 {
-                isTapDragging = true
-                lightHaptic.impactOccurred()
-            }
+        } else {
+            maxTouchCountInStroke = max(maxTouchCountInStroke, allCount)
         }
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let allTouches = event?.allTouches, !touches.isEmpty else { return }
 
-        let fingerCount = allTouches.count
+        let activeTouches = allTouches.filter { $0.phase != .ended && $0.phase != .cancelled }
+        let fingerCount = max(1, activeTouches.count)
+        maxTouchCountInStroke = max(maxTouchCountInStroke, fingerCount)
+
         var sumDx: Float = 0.0
         var sumDy: Float = 0.0
         var count: Float = 0.0
@@ -81,17 +79,14 @@ final class TrackpadUIView: UIView {
                 sumDy += Float(curr.y - prev.y)
             }
             count += 1.0
-
-            let curr = touch.location(in: self)
-            if hypot(curr.x - initialTouchPoint.x, curr.y - initialTouchPoint.y) > 6.0 {
-                hasMovedSignificantly = true
-            }
         }
 
         guard count > 0 else { return }
         let avgDx = sumDx / count
         let avgDy = sumDy / count
         guard avgDx != 0 || avgDy != 0 else { return }
+
+        totalPathDistance += CGFloat(hypot(avgDx, avgDy))
 
         let sens = Float(TrackpadSettings.shared.sensitivity)
         let dx = avgDx * sens
@@ -100,23 +95,35 @@ final class TrackpadUIView: UIView {
         isFirstMoveInStroke = false
 
         if fingerCount == 1 {
-            if isTapDragging {
-                MultipeerClient.shared.sendDrag(dx: dx, dy: dy, isStrokeStart: strokeStart)
-            } else {
-                MultipeerClient.shared.sendMove(dx: dx, dy: dy, isStrokeStart: strokeStart)
+            // Single finger ONLY moves cursor (never auto-drags unless user is explicitly holding the bottom Left Button)
+            if isThreeFingerDragging {
+                isThreeFingerDragging = false
+                MultipeerClient.shared.sendDragRelease()
             }
-        } else if fingerCount >= 2 {
+            MultipeerClient.shared.sendMove(dx: dx, dy: dy, isStrokeStart: strokeStart)
+        } else if fingerCount == 2 {
+            if isThreeFingerDragging {
+                isThreeFingerDragging = false
+                MultipeerClient.shared.sendDragRelease()
+            }
             MultipeerClient.shared.sendScroll(dx: dx, dy: dy, isStrokeStart: strokeStart)
+        } else if fingerCount >= 3 {
+            // Native macOS Three-Finger Drag (三指拖移)
+            if !isThreeFingerDragging {
+                isThreeFingerDragging = true
+                lightHaptic.impactOccurred()
+            }
+            MultipeerClient.shared.sendDrag(dx: dx, dy: dy, isStrokeStart: strokeStart)
         }
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let allTouches = event?.allTouches else { return }
-        let remainingTouches = allTouches.subtracting(touches)
+        let remainingTouches = allTouches.subtracting(touches).filter { $0.phase != .ended && $0.phase != .cancelled }
 
         if remainingTouches.isEmpty {
-            if isTapDragging {
-                isTapDragging = false
+            if isThreeFingerDragging {
+                isThreeFingerDragging = false
                 MultipeerClient.shared.sendDragRelease()
                 return
             }
@@ -124,13 +131,12 @@ final class TrackpadUIView: UIView {
             let now = ProcessInfo.processInfo.systemUptime
             let duration = now - touchDownTime
 
-            if duration < 0.25 && !hasMovedSignificantly {
-                let initialCount = allTouches.count
-                if initialCount == 1 {
-                    lastTapTime = now
+            // Strict tap detection: only fire click if finger barely moved (< 1.8pt total path) and was brief (< 0.18s)
+            if duration < 0.18 && totalPathDistance < 1.8 {
+                if maxTouchCountInStroke == 1 {
                     lightHaptic.impactOccurred()
                     MultipeerClient.shared.sendClick(isRight: false)
-                } else if initialCount >= 2 {
+                } else if maxTouchCountInStroke == 2 {
                     mediumHaptic.impactOccurred()
                     MultipeerClient.shared.sendClick(isRight: true)
                 }
@@ -139,8 +145,8 @@ final class TrackpadUIView: UIView {
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-        if isTapDragging {
-            isTapDragging = false
+        if isThreeFingerDragging {
+            isThreeFingerDragging = false
             MultipeerClient.shared.sendDragRelease()
         }
     }
@@ -159,6 +165,9 @@ struct TrackpadRepresentable: UIViewRepresentable {
 // MARK: - Expansive Minimalist Trackpad View
 
 public struct TrackpadView: View {
+    @State private var isHoldingLeftButton: Bool = false
+    @State private var leftDownTime: TimeInterval = 0
+
     private let lightHaptic = UIImpactFeedbackGenerator(style: .light)
     private let mediumHaptic = UIImpactFeedbackGenerator(style: .medium)
 
@@ -180,19 +189,36 @@ public struct TrackpadView: View {
             .padding(.horizontal, 12)
             .padding(.top, 8)
 
-            // Left / Right Buttons
+            // Left / Right Physical Buttons (Left button supports both tap-click and press-hold-to-drag!)
             HStack(spacing: 0) {
-                Button {
-                    lightHaptic.impactOccurred()
-                    MultipeerClient.shared.sendClick(isRight: false)
-                } label: {
-                    Text("左键")
-                        .font(.system(size: 13, weight: .regular))
-                        .foregroundColor(AppTheme.textSecondary)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
+                Text("左键")
+                    .font(.system(size: 13, weight: isHoldingLeftButton ? .medium : .regular))
+                    .foregroundColor(isHoldingLeftButton ? AppTheme.accent : AppTheme.textSecondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(isHoldingLeftButton ? AppTheme.surfaceElevated : Color.clear)
+                    .contentShape(Rectangle())
+                    .gesture(
+                        DragGesture(minimumDistance: 0)
+                            .onChanged { _ in
+                                if !isHoldingLeftButton {
+                                    isHoldingLeftButton = true
+                                    leftDownTime = ProcessInfo.processInfo.systemUptime
+                                    lightHaptic.impactOccurred()
+                                    MultipeerClient.shared.sendDragStart()
+                                }
+                            }
+                            .onEnded { _ in
+                                if isHoldingLeftButton {
+                                    isHoldingLeftButton = false
+                                    let heldDuration = ProcessInfo.processInfo.systemUptime - leftDownTime
+                                    if heldDuration < 0.20 {
+                                        MultipeerClient.shared.sendClick(isRight: false)
+                                    } else {
+                                        MultipeerClient.shared.sendDragRelease()
+                                    }
+                                }
+                            }
+                    )
 
                 Rectangle()
                     .fill(AppTheme.border)

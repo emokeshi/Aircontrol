@@ -90,7 +90,7 @@ public final class InputSimulator: @unchecked Sendable {
         return CGPoint(x: clampedX, y: clampedY)
     }
 
-    // MARK: - Zero-Latency Direct Pointer Movement
+    // MARK: - Zero-Latency Direct Pointer Movement (0x01: Pure Move, Never Drags)
 
     public func move(dx: Float, dy: Float) {
         guard dx != 0 || dy != 0 else { return }
@@ -99,7 +99,6 @@ public final class InputSimulator: @unchecked Sendable {
         let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         syncCursorPositionIfNeededLocked(now: now)
 
-        // Jitter-immune non-linear acceleration based solely on touch delta magnitude
         let dist = hypotf(dx, dy)
         let baseGain = Self.baseMultiplier * sensitivity
         let rawAccel = baseGain * (1.0 + min(dist * 0.10, 1.8))
@@ -111,11 +110,11 @@ public final class InputSimulator: @unchecked Sendable {
         let target = snapToDisplayBoundsLocked(rawTarget)
         cachedX = target.x
         cachedY = target.y
-        let dragFlag = isDragging
+        let dragActive = isDragging
         os_unfair_lock_unlock(&lock)
 
         let t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-        let eventType: CGEventType = dragFlag ? .leftMouseDragged : .mouseMoved
+        let eventType: CGEventType = dragActive ? .leftMouseDragged : .mouseMoved
         if let event = CGEvent(
             mouseEventSource: nil,
             mouseType: eventType,
@@ -126,6 +125,57 @@ public final class InputSimulator: @unchecked Sendable {
         }
         let dtUs = Double(clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1_000.0
         DiagnosticLogger.shared.recordCgEventPost(durationUs: dtUs, coalesced: false)
+    }
+
+    // MARK: - Explicit Drag Movement (0x03: Posts leftMouseDown only once, then leftMouseDragged)
+
+    public func dragMove(dx: Float, dy: Float) {
+        guard dx != 0 || dy != 0 else { return }
+
+        var needMouseDown = false
+        var downPoint: CGPoint = .zero
+
+        os_unfair_lock_lock(&lock)
+        let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        syncCursorPositionIfNeededLocked(now: now)
+
+        if !isDragging {
+            isDragging = true
+            needMouseDown = true
+            downPoint = CGPoint(x: cachedX, y: cachedY)
+        }
+
+        let dist = hypotf(dx, dy)
+        let baseGain = Self.baseMultiplier * sensitivity
+        let rawAccel = baseGain * (1.0 + min(dist * 0.10, 1.8))
+        let accel = lastAccel + 0.45 * (rawAccel - lastAccel)
+        lastAccel = accel
+
+        let rawTarget = CGPoint(x: cachedX + Double(dx * accel), y: cachedY + Double(dy * accel))
+        let target = snapToDisplayBoundsLocked(rawTarget)
+        cachedX = target.x
+        cachedY = target.y
+        os_unfair_lock_unlock(&lock)
+
+        if needMouseDown {
+            if let downEv = CGEvent(
+                mouseEventSource: nil,
+                mouseType: .leftMouseDown,
+                mouseCursorPosition: downPoint,
+                mouseButton: .left
+            ) {
+                downEv.post(tap: .cgSessionEventTap)
+            }
+        }
+
+        if let dragEv = CGEvent(
+            mouseEventSource: nil,
+            mouseType: .leftMouseDragged,
+            mouseCursorPosition: target,
+            mouseButton: .left
+        ) {
+            dragEv.post(tap: .cgSessionEventTap)
+        }
     }
 
     // MARK: - Zero-Latency Scroll
@@ -160,13 +210,20 @@ public final class InputSimulator: @unchecked Sendable {
     // MARK: - Clicks & Drag State
 
     public func setDragging(_ dragging: Bool) {
+        var shouldPost = false
+        var targetPoint: CGPoint = .zero
+
         os_unfair_lock_lock(&lock)
         let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         syncCursorPositionIfNeededLocked(now: now)
-        let targetPoint = CGPoint(x: cachedX, y: cachedY)
-        isDragging = dragging
+        targetPoint = CGPoint(x: cachedX, y: cachedY)
+        if isDragging != dragging {
+            isDragging = dragging
+            shouldPost = true
+        }
         os_unfair_lock_unlock(&lock)
 
+        guard shouldPost else { return }
         let eventType: CGEventType = dragging ? .leftMouseDown : .leftMouseUp
         if let event = CGEvent(
             mouseEventSource: nil,
@@ -183,6 +240,7 @@ public final class InputSimulator: @unchecked Sendable {
         let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         syncCursorPositionIfNeededLocked(now: now)
         let targetPoint = CGPoint(x: cachedX, y: cachedY)
+        isDragging = false
         os_unfair_lock_unlock(&lock)
 
         let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: targetPoint, mouseButton: .left)
@@ -196,6 +254,7 @@ public final class InputSimulator: @unchecked Sendable {
         let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         syncCursorPositionIfNeededLocked(now: now)
         let targetPoint = CGPoint(x: cachedX, y: cachedY)
+        isDragging = false
         os_unfair_lock_unlock(&lock)
 
         let down1 = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: targetPoint, mouseButton: .left)
@@ -216,6 +275,7 @@ public final class InputSimulator: @unchecked Sendable {
         let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         syncCursorPositionIfNeededLocked(now: now)
         let targetPoint = CGPoint(x: cachedX, y: cachedY)
+        isDragging = false
         os_unfair_lock_unlock(&lock)
 
         let down = CGEvent(mouseEventSource: nil, mouseType: .rightMouseDown, mouseCursorPosition: targetPoint, mouseButton: .right)

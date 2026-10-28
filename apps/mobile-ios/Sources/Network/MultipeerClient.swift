@@ -771,6 +771,10 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
         sendMotionPacket(eventType: 0x05, dx: 0, dy: 0, isStrokeStart: true)
     }
 
+    public func sendDragStart() {
+        sendMotionPacket(eventType: 0x06, dx: 0, dy: 0, isStrokeStart: true)
+    }
+
     // MARK: - Control Channel
 
     private func sendJson(_ object: [String: Any]) {

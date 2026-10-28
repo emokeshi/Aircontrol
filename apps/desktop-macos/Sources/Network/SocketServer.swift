@@ -171,8 +171,7 @@ public final class SocketServer: @unchecked Sendable {
             case 0x02:
                 InputSimulator.shared.scroll(dx: dx, dy: dy)
             case 0x03:
-                InputSimulator.shared.setDragging(true)
-                InputSimulator.shared.move(dx: dx, dy: dy)
+                InputSimulator.shared.dragMove(dx: dx, dy: dy)
             case 0x04:
                 if flags & 0x08 != 0 {
                     InputSimulator.shared.doubleClick()
@@ -183,6 +182,8 @@ public final class SocketServer: @unchecked Sendable {
                 }
             case 0x05:
                 InputSimulator.shared.setDragging(false)
+            case 0x06:
+                InputSimulator.shared.setDragging(true)
             default:
                 break
             }
