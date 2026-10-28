@@ -2,6 +2,8 @@ name: Release Build & Publish
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   workflow_dispatch:
@@ -10,35 +12,25 @@ permissions:
   contents: write
 
 jobs:
-  build-and-release:
-    runs-on: macos-14
+  publish-release:
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Build macOS Host Agent
-        run: |
-          chmod +x scripts/build-macos.sh
-          ./scripts/build-macos.sh
-          cd apps/desktop-macos/build
-          zip -qr9 AirControl-macOS.zip AirControl.app
-          mkdir -p ../../../dist
-          cp AirControl-macOS.zip ../../../dist/
-
-      - name: Build iOS Application (.ipa)
-        run: |
-          chmod +x scripts/build-ipa.sh
-          ./scripts/build-ipa.sh
-          mkdir -p dist
-          cp apps/mobile-ios/build/AirControl.ipa dist/
-
-      - name: Create GitHub Release & Upload Assets
+      - name: Publish GitHub Release Assets
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
         with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v1.3.0' }}
+          name: "AirControl v1.3.0"
+          body: |
+            ### AirControl v1.3.0 更新内容
+            - **电脑端 (`AirControl-macOS.zip`)**：解压后打开 `AirControl.app`，点击顶部菜单栏图标即可使用。
+            - **手机端 (`AirControl.ipa`)**：支持 SideStore、AltStore、TrollStore 或爱思助手安装，已补齐 iOS 桌面图标。
+            - **核心改进**：修复移动卡顿与单指误触拖拽问题，新增双路并发直连、应用秒级同步与手机端日志导出功能。
           files: |
             dist/AirControl-macOS.zip
             dist/AirControl.ipa
           draft: false
           prerelease: false
-          generate_release_notes: true
+          make_latest: "true"

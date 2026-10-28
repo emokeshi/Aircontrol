@@ -8,12 +8,49 @@
     <string>com.aircontrol.mobile</string>
     <key>CFBundleName</key>
     <string>AirControl</string>
+    <key>CFBundleDisplayName</key>
+    <string>AirControl</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.2.0</string>
+    <string>1.3.0</string>
     <key>CFBundleVersion</key>
-    <string>3</string>
+    <string>4</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleIconName</key>
+    <string>AppIcon</string>
+    <key>CFBundleIcons</key>
+    <dict>
+        <key>CFBundlePrimaryIcon</key>
+        <dict>
+            <key>CFBundleIconFiles</key>
+            <array>
+                <string>AppIcon60x60</string>
+                <string>AppIcon</string>
+            </array>
+            <key>CFBundleIconName</key>
+            <string>AppIcon</string>
+            <key>UIPrerenderedIcon</key>
+            <true/>
+        </dict>
+    </dict>
+    <key>CFBundleIcons~ipad</key>
+    <dict>
+        <key>CFBundlePrimaryIcon</key>
+        <dict>
+            <key>CFBundleIconFiles</key>
+            <array>
+                <string>AppIcon60x60</string>
+                <string>AppIcon76x76</string>
+                <string>AppIcon</string>
+            </array>
+            <key>CFBundleIconName</key>
+            <string>AppIcon</string>
+            <key>UIPrerenderedIcon</key>
+            <true/>
+        </dict>
+    </dict>
     <key>LSRequiresIPhoneOS</key>
     <true/>
     <key>MinimumOSVersion</key>
@@ -34,11 +71,11 @@
         <string>UIInterfaceOrientationPortrait</string>
     </array>
     <key>NSLocalNetworkUsageDescription</key>
-    <string>AirControl 使用苹果原生无线对等技术自动直连您的 Mac。</string>
+    <string>用于局域网直连控制 Mac。</string>
     <key>NSBluetoothAlwaysUsageDescription</key>
-    <string>AirControl 使用低功耗蓝牙与 Mac 建立近场极速配对。</string>
+    <string>用于近场发现并配对 Mac。</string>
     <key>NSBluetoothPeripheralUsageDescription</key>
-    <string>AirControl 使用低功耗蓝牙与 Mac 建立近场极速配对。</string>
+    <string>用于近场发现并配对 Mac。</string>
     <key>NSBonjourServices</key>
     <array>
         <string>_aircontrol-p2p._tcp</string>

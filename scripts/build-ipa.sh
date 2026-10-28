@@ -43,11 +43,24 @@ DEVELOPER_DIR="${DEV_DIR}" xcrun swiftc \
   "${IOS_DIR}/Sources/App/"*.swift \
   -o "${APP_DIR}/AirControl"
 
-echo "==> Copying App metadata and Info.plist..."
+echo "==> Copying App metadata, Info.plist, and AppIcon assets..."
 cp "${IOS_DIR}/Info.plist" "${APP_DIR}/Info.plist"
-if [ -f "${IOS_DIR}/AppIcon.png" ]; then
-    cp "${IOS_DIR}/AppIcon.png" "${APP_DIR}/AppIcon.png"
+
+for icon_file in AppIcon.png AppIcon60x60@2x.png AppIcon60x60@3x.png AppIcon76x76@2x~ipad.png; do
+    if [ -f "${IOS_DIR}/${icon_file}" ]; then
+        cp "${IOS_DIR}/${icon_file}" "${APP_DIR}/${icon_file}"
+    fi
+done
+
+if [ -d "${IOS_DIR}/Assets.xcassets" ]; then
+    DEVELOPER_DIR="${DEV_DIR}" xcrun actool "${IOS_DIR}/Assets.xcassets" \
+        --compile "${APP_DIR}" \
+        --platform iphoneos \
+        --minimum-deployment-target 16.0 \
+        --app-icon AppIcon \
+        --output-partial-info-plist "${TEMP_DIR}/assetcatalog_generated_info.plist" >/dev/null 2>&1 || true
 fi
+
 echo "APPL????" > "${APP_DIR}/PkgInfo"
 
 echo "==> Performing ad-hoc codesign on AirControl.app..."

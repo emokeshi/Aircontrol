@@ -27,7 +27,7 @@ Package.resolved
 *.apk
 *.aab
 *.app
-*.ipa
+!dist/AirControl.ipa
 .pub-cache/
 .pub/
 ephemeral/
