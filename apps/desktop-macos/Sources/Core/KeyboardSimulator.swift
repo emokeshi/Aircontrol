@@ -21,9 +21,10 @@ public final class KeyboardSimulator {
     }
 
     public func postKeyEvent(keyCode: UInt16, isDown: Bool, modifiers: Modifiers) {
-        guard let event = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: isDown) else { return }
+        let source = CGEventSource(stateID: .privateState)
+        guard let event = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: isDown) else { return }
 
-        var flags = CGEventFlags()
+        var flags = CGEventFlags.maskNonCoalesced
         if modifiers.cmd { flags.insert(.maskCommand) }
         if modifiers.opt { flags.insert(.maskAlternate) }
         if modifiers.ctrl { flags.insert(.maskControl) }
@@ -34,27 +35,37 @@ public final class KeyboardSimulator {
     }
 
     public func typeUnicodeString(_ text: String) {
-        let utf16 = Array(text.utf16)
-        guard !utf16.isEmpty else { return }
+        guard !text.isEmpty else { return }
+        let source = CGEventSource(stateID: .privateState)
 
-        // Chunk up to 16 UTF-16 code units per CGEvent so multi-character IME words and pasted text never drop characters
-        let chunkSize = 16
-        var offset = 0
-        while offset < utf16.count {
-            let end = min(offset + chunkSize, utf16.count)
-            var slice = Array(utf16[offset..<end])
+        // Post one Character (grapheme cluster / BMP char / surrogate pair) per CGEvent pair
+        // with .privateState and .maskNonCoalesced so Chinese IME words, punctuation, and Emoji
+        // never get swallowed by macOS TSM or coalesced across rapid dictation bursts.
+        let characters = Array(text)
+        for (index, ch) in characters.enumerated() {
+            if ch == "\n" || ch == "\r" {
+                postKeyEvent(keyCode: 36, isDown: true, modifiers: Modifiers())
+                postKeyEvent(keyCode: 36, isDown: false, modifiers: Modifiers())
+                if index + 1 < characters.count {
+                    usleep(1200)
+                }
+                continue
+            }
 
-            if let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
-               let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) {
-                down.flags = []
-                up.flags = []
-                down.keyboardSetUnicodeString(stringLength: slice.count, unicodeString: &slice)
-                up.keyboardSetUnicodeString(stringLength: slice.count, unicodeString: &slice)
+            var utf16 = Array(String(ch).utf16)
+            guard !utf16.isEmpty else { continue }
+
+            if let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
+               let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) {
+                down.flags = .maskNonCoalesced
+                up.flags = .maskNonCoalesced
+                down.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
+                up.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: &utf16)
                 down.post(tap: .cgSessionEventTap)
                 up.post(tap: .cgSessionEventTap)
             }
-            offset = end
-            if offset < utf16.count {
+
+            if index + 1 < characters.count {
                 usleep(1200)
             }
         }

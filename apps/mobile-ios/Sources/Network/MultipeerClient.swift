@@ -444,7 +444,9 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
                     DiagnosticLogger.shared.recordKeepAwakePulse()
                     DispatchQueue.main.async {
                         self.lastUdpPongTime = ProcessInfo.processInfo.systemUptime
-                        self.isUdpVerified = true
+                        if !self.isUdpVerified {
+                            self.isUdpVerified = true
+                        }
                     }
                 } else if subType == 0xFF && data.count >= 16 {
                     let sentMs = data.withUnsafeBytes { raw -> UInt64 in
@@ -455,13 +457,20 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
                     let rtt = sentMs > 0 && nowMs >= sentMs ? Int(nowMs - sentMs) : 1
                     DispatchQueue.main.async {
                         let wasVerified = self.isUdpVerified
-                        self.isUdpVerified = true
+                        if !self.isUdpVerified {
+                            self.isUdpVerified = true
+                        }
                         self.lastUdpPongTime = ProcessInfo.processInfo.systemUptime
-                        self.udpRttMs = max(1, min(rtt, 999))
-                        self.latencyMs = self.udpRttMs
-                        DiagnosticLogger.shared.recordUdpEcho(rttMs: self.udpRttMs)
+                        let clampedRtt = max(1, min(rtt, 999))
+                        if self.udpRttMs != clampedRtt {
+                            self.udpRttMs = clampedRtt
+                        }
+                        if self.latencyMs != clampedRtt {
+                            self.latencyMs = clampedRtt
+                        }
+                        DiagnosticLogger.shared.recordUdpEcho(rttMs: clampedRtt)
                         if !wasVerified {
-                            DiagnosticLogger.shared.log("UDP", "UDP Direct VERIFIED (\(host):8920, RTT=\(self.udpRttMs)ms)")
+                            DiagnosticLogger.shared.log("UDP", "UDP Direct VERIFIED (\(host):8920, RTT=\(clampedRtt)ms)")
                             self.shutdownRedundantMcSessionIfReady()
                         }
                     }
@@ -629,8 +638,10 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
             case "pong":
                 if let sentAt = (json["client_time"] as? Double) ?? (json["timestamp"] as? Double) {
                     let now = Date().timeIntervalSince1970 * 1000
-                    let rtt = Int(now - sentAt)
-                    self.latencyMs = max(1, min(rtt, 999))
+                    let rtt = max(1, min(Int(now - sentAt), 999))
+                    if self.latencyMs != rtt {
+                        self.latencyMs = rtt
+                    }
                 }
 
             case "dock_list":
