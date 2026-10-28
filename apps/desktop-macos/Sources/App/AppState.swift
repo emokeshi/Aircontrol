@@ -41,8 +41,8 @@ public final class AppState: ObservableObject {
     }
 
     public func refreshLocalIP() {
-        var en0IP: String? = nil
-        var allLanIPs: [String] = []
+        var wiredIPs: [String] = []
+        var wifiIPs: [String] = []
         var ifaddr: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else {
             self.localIP = "127.0.0.1"
@@ -56,34 +56,32 @@ public final class AppState: ObservableObject {
             let addrFamily = interface.ifa_addr.pointee.sa_family
             if addrFamily == UInt8(AF_INET) {
                 let name = String(cString: interface.ifa_name)
-                if name.starts(with: "en") || name.starts(with: "bridge") {
+                if name.starts(with: "en") {
                     var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
                     getnameinfo(interface.ifa_addr, socklen_t(interface.ifa_addr.pointee.sa_len),
                                 &hostname, socklen_t(hostname.count),
                                 nil, socklen_t(0), NI_NUMERICHOST)
                     let foundIP = String(cString: hostname)
-                    if !foundIP.isEmpty && foundIP != "127.0.0.1" && !foundIP.hasPrefix("169.254.") {
+                    if !foundIP.isEmpty && foundIP != "127.0.0.1" && !foundIP.hasPrefix("169.254.") && !foundIP.hasPrefix("198.18.") {
                         if name == "en0" {
-                            en0IP = foundIP
-                        }
-                        if !allLanIPs.contains(foundIP) {
-                            allLanIPs.append(foundIP)
+                            if !wifiIPs.contains(foundIP) {
+                                wifiIPs.append(foundIP)
+                            }
+                        } else {
+                            // en1..en9 (e.g. en3 AX88772A Wired Ethernet) has 0ms 802.11 Beacon sleep!
+                            if !wiredIPs.contains(foundIP) {
+                                wiredIPs.append(foundIP)
+                            }
                         }
                     }
                 }
             }
         }
 
-        if let primary = en0IP {
-            // Put en0 (Wi-Fi) first
-            allLanIPs.removeAll(where: { $0 == primary })
-            allLanIPs.insert(primary, at: 0)
-            self.localIP = primary
-        } else if let first = allLanIPs.first {
-            self.localIP = first
-        } else {
-            self.localIP = "127.0.0.1"
-        }
-        self.localIPs = allLanIPs
+        // Prioritize Wired Ethernet (en3) first to avoid secondary en0 102.4ms 802.11 PS-Poll sleep,
+        // while keeping all LAN IPs in localIPs for multi-path delivery.
+        let combined = wiredIPs + wifiIPs
+        self.localIPs = combined
+        self.localIP = combined.first ?? "127.0.0.1"
     }
 }

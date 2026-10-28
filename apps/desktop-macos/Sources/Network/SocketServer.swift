@@ -1,6 +1,7 @@
 import Foundation
 import Network
 import CoreGraphics
+import os
 
 public final class SocketServer: @unchecked Sendable {
     public static let shared = SocketServer()
@@ -19,8 +20,12 @@ public final class SocketServer: @unchecked Sendable {
         return activeTcpConnection != nil
     }
 
-    private var lastProcessedSeq: UInt16 = 0
-    private var hasProcessedSeq: Bool = false
+    // Lock-protected 128-entry sequence number ring for multi-path (UDP en3 + UDP en0 + TCP_NODELAY) deduplication
+    private var seqLock = os_unfair_lock()
+    private var seenSeqRing = [UInt16](repeating: 0, count: 128)
+    private var seenSeqValid = [Bool](repeating: false, count: 128)
+    private var seenSeqCursor: Int = 0
+    private var lastKeepAwakeReplyNs: UInt64 = 0
 
     private init() {}
 
@@ -34,7 +39,7 @@ public final class SocketServer: @unchecked Sendable {
         publishBonjour(port: tcpPort)
         isRunning = true
 
-        DiagnosticLogger.shared.log("NET", "SocketServer listening on TCP:\(tcpPort) UDP:\(udpPort)")
+        DiagnosticLogger.shared.log("NET", "SocketServer listening on TCP:\(tcpPort) UDP:\(udpPort) (VPN utun bypassed)")
 
         SystemController.shared.startWorkspaceMonitoring(
             onAppListChanged: { [weak self] in
@@ -72,6 +77,8 @@ public final class SocketServer: @unchecked Sendable {
         let params = NWParameters.udp
         params.allowLocalEndpointReuse = true
         params.serviceClass = .interactiveVideo
+        // Bypass virtual VPN TUN interfaces (utun) which have interface type .other
+        params.prohibitedInterfaceTypes = [.other]
 
         guard let listener = try? NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!) else { return }
 
@@ -102,12 +109,35 @@ public final class SocketServer: @unchecked Sendable {
                         }
                     } else {
                         self.processMotionPacket(data, isUdp: true)
+                        // Send a 4-byte 802.11 PM=0 Radio Keep-Awake pulse every 20ms during active motion
+                        // so neither Mac nor iPhone Wi-Fi enters 102.4ms 802.11 PS-Poll Beacon sleep!
+                        let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+                        if (now - self.lastKeepAwakeReplyNs) >= 20_000_000 {
+                            self.lastKeepAwakeReplyNs = now
+                            let keepAwake = Data([0xA8, 0xFD, data[2], data[3]])
+                            connection.send(content: keepAwake, completion: .idempotent)
+                        }
                     }
                 }
                 receiveNext()
             }
         }
         receiveNext()
+    }
+
+    private func checkAndMarkSequence(_ seq: UInt16) -> Bool {
+        os_unfair_lock_lock(&seqLock)
+        for i in 0..<128 {
+            if seenSeqValid[i] && seenSeqRing[i] == seq {
+                os_unfair_lock_unlock(&seqLock)
+                return false
+            }
+        }
+        seenSeqRing[seenSeqCursor] = seq
+        seenSeqValid[seenSeqCursor] = true
+        seenSeqCursor = (seenSeqCursor + 1) & 127
+        os_unfair_lock_unlock(&seqLock)
+        return true
     }
 
     public func processMotionPacket(_ data: Data, isUdp: Bool = true) {
@@ -118,22 +148,22 @@ public final class SocketServer: @unchecked Sendable {
             let rawSeq = ptr.load(fromByteOffset: 2, as: UInt16.self)
             let seq = UInt16(bigEndian: rawSeq)
 
-            // Deduplicate if the same sequence number arrived twice during channel switch
-            if hasProcessedSeq && seq == lastProcessedSeq && eventType <= 0x03 {
+            // Multi-path race deduplication: whichever path (en3 UDP, en0 UDP, or TCP_NODELAY) arrives first wins!
+            if !checkAndMarkSequence(seq) {
+                DiagnosticLogger.shared.recordDuplicateDrop()
                 return
             }
-            lastProcessedSeq = seq
-            hasProcessedSeq = true
 
-            DiagnosticLogger.shared.recordMotionRx(isUdp: isUdp, seq: seq)
+            let rawFlags = ptr.load(fromByteOffset: 14, as: UInt16.self)
+            let flags = UInt16(bigEndian: rawFlags)
+            let isStrokeStart = (flags & 0x80) != 0
+
+            DiagnosticLogger.shared.recordMotionRx(isUdp: isUdp, seq: seq, isStrokeStart: isStrokeStart)
 
             let rawDx = ptr.load(fromByteOffset: 4, as: UInt32.self)
             let rawDy = ptr.load(fromByteOffset: 8, as: UInt32.self)
             let dx = Float(bitPattern: UInt32(bigEndian: rawDx))
             let dy = Float(bitPattern: UInt32(bigEndian: rawDy))
-
-            let rawFlags = ptr.load(fromByteOffset: 14, as: UInt16.self)
-            let flags = UInt16(bigEndian: rawFlags)
 
             switch eventType {
             case 0x01:
@@ -159,7 +189,7 @@ public final class SocketServer: @unchecked Sendable {
         }
     }
 
-    // MARK: - Low-Latency TCP_NODELAY Control Listener
+    // MARK: - Low-Latency TCP_NODELAY Control & Redundant Motion Listener
 
     private func startTcp(port: UInt16) {
         let tcpOptions = NWProtocolTCP.Options()
@@ -170,6 +200,7 @@ public final class SocketServer: @unchecked Sendable {
         let params = NWParameters(tls: nil, tcp: tcpOptions)
         params.allowLocalEndpointReuse = true
         params.serviceClass = .interactiveVideo
+        params.prohibitedInterfaceTypes = [.other]
 
         guard let listener = try? NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!) else { return }
 
@@ -189,6 +220,7 @@ public final class SocketServer: @unchecked Sendable {
             switch state {
             case .ready:
                 DiagnosticLogger.shared.log("TCP", "Direct TCP client connected: \(String(describing: connection?.endpoint))")
+                MultipeerServer.shared.suspendForDirectSocket()
             case .failed(let err):
                 DiagnosticLogger.shared.log("TCP", "Direct TCP failed: \(err.localizedDescription)")
                 if self.activeTcpConnection === connection {
@@ -230,8 +262,11 @@ public final class SocketServer: @unchecked Sendable {
                         return
                     }
 
-                    if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                       let type = json["type"] as? String {
+                    // Fast-path: 16-byte binary motion packet over TCP_NODELAY (races in parallel with UDP)
+                    if payloadLength == 16 && data[0] == 0xA8 {
+                        self.processMotionPacket(data, isUdp: false)
+                    } else if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                              let type = json["type"] as? String {
                         self.processTcpMessage(json, type: type, connection: connection)
                     }
 
@@ -256,7 +291,6 @@ public final class SocketServer: @unchecked Sendable {
         guard let conn = activeTcpConnection else { return }
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
             guard let self = self else { return }
-            // Send lightweight metadata first (< 800 bytes) so app list appears in < 5ms
             let apps = SystemController.shared.getRunningApplications(includeIcons: false)
             let appDicts: [[String: Any]] = apps.map { app in
                 [

@@ -24,12 +24,7 @@ final class TrackpadUIView: UIView {
     private var lastTapTime: TimeInterval = 0
     private var hasMovedSignificantly: Bool = false
     private var isTapDragging: Bool = false
-
-    // Sub-frame micro-burst accumulator (prevents duplicate packets within < 4ms)
-    private var lastSendUptime: TimeInterval = 0
-    private var accDx: Float = 0.0
-    private var accDy: Float = 0.0
-    private var lastFingerCount: Int = 1
+    private var isFirstMoveInStroke: Bool = true
 
     private let lightHaptic = UIImpactFeedbackGenerator(style: .light)
     private let mediumHaptic = UIImpactFeedbackGenerator(style: .medium)
@@ -52,8 +47,7 @@ final class TrackpadUIView: UIView {
             initialTouchPoint = touch.location(in: self)
             touchDownTime = now
             hasMovedSignificantly = false
-            accDx = 0.0
-            accDy = 0.0
+            isFirstMoveInStroke = true
 
             // Double-tap and hold to drag (native macOS trackpad gesture)
             if touches.count == 1 && (now - lastTapTime) < 0.25 {
@@ -100,43 +94,25 @@ final class TrackpadUIView: UIView {
         guard avgDx != 0 || avgDy != 0 else { return }
 
         let sens = Float(TrackpadSettings.shared.sensitivity)
-        accDx += avgDx * sens
-        accDy += avgDy * sens
-        lastFingerCount = fingerCount
+        let dx = avgDx * sens
+        let dy = avgDy * sens
+        let strokeStart = isFirstMoveInStroke
+        isFirstMoveInStroke = false
 
-        let now = ProcessInfo.processInfo.systemUptime
-        // Allow up to 240Hz (4ms min interval) so 60Hz/120Hz frames pass with 0.0ms delay,
-        // while coalescing same-tick multi-touch callbacks.
-        if (now - lastSendUptime) >= 0.004 {
-            flushAccumulatedDelta(now: now)
-        }
-    }
-
-    private func flushAccumulatedDelta(now: TimeInterval) {
-        guard accDx != 0 || accDy != 0 else { return }
-        let dx = accDx
-        let dy = accDy
-        accDx = 0.0
-        accDy = 0.0
-        lastSendUptime = now
-
-        if lastFingerCount == 1 {
+        if fingerCount == 1 {
             if isTapDragging {
-                MultipeerClient.shared.sendDrag(dx: dx, dy: dy)
+                MultipeerClient.shared.sendDrag(dx: dx, dy: dy, isStrokeStart: strokeStart)
             } else {
-                MultipeerClient.shared.sendMove(dx: dx, dy: dy)
+                MultipeerClient.shared.sendMove(dx: dx, dy: dy, isStrokeStart: strokeStart)
             }
-        } else if lastFingerCount >= 2 {
-            MultipeerClient.shared.sendScroll(dx: dx, dy: dy)
+        } else if fingerCount >= 2 {
+            MultipeerClient.shared.sendScroll(dx: dx, dy: dy, isStrokeStart: strokeStart)
         }
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         guard let allTouches = event?.allTouches else { return }
         let remainingTouches = allTouches.subtracting(touches)
-
-        let now = ProcessInfo.processInfo.systemUptime
-        flushAccumulatedDelta(now: now)
 
         if remainingTouches.isEmpty {
             if isTapDragging {
@@ -145,6 +121,7 @@ final class TrackpadUIView: UIView {
                 return
             }
 
+            let now = ProcessInfo.processInfo.systemUptime
             let duration = now - touchDownTime
 
             if duration < 0.25 && !hasMovedSignificantly {
@@ -162,8 +139,6 @@ final class TrackpadUIView: UIView {
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-        accDx = 0.0
-        accDy = 0.0
         if isTapDragging {
             isTapDragging = false
             MultipeerClient.shared.sendDragRelease()

@@ -18,6 +18,7 @@ public final class DiagnosticLogger: ObservableObject, @unchecked Sendable {
     public private(set) var udpTxCount: UInt64 = 0
     public private(set) var mcTxCount: UInt64 = 0
     public private(set) var udpEchoCount: UInt64 = 0
+    public private(set) var keepAwakeRxCount: UInt64 = 0
     public private(set) var lastDockSyncMs: Int = 0
 
     private var lastTxTimeNs: UInt64 = 0
@@ -49,7 +50,7 @@ public final class DiagnosticLogger: ObservableObject, @unchecked Sendable {
         }
     }
 
-    public func recordMotionTx(viaUdp: Bool, activeChannelDesc: String) {
+    public func recordMotionTx(viaUdp: Bool, activeChannelDesc: String, isStrokeStart: Bool) {
         let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         var summaryLine: String? = nil
 
@@ -60,9 +61,9 @@ public final class DiagnosticLogger: ObservableObject, @unchecked Sendable {
             mcTxCount += 1
         }
 
-        if lastTxTimeNs > 0 {
+        if !isStrokeStart && lastTxTimeNs > 0 {
             let dtMs = Double(now - lastTxTimeNs) / 1_000_000.0
-            if dtMs < 250.0 {
+            if dtMs < 180.0 {
                 intervalSumMs += dtMs
                 intervalCount += 1
                 if dtMs > intervalMaxMs {
@@ -78,8 +79,8 @@ public final class DiagnosticLogger: ObservableObject, @unchecked Sendable {
             let avgDt = intervalSumMs / Double(intervalCount)
             let maxDt = intervalMaxMs
             summaryLine = String(
-                format: "TX ch=%@ udp_tx=%llu mc_tx=%llu echoes=%llu | dt_avg=%.2fms dt_max=%.2fms",
-                activeChannelDesc, udpTxCount, mcTxCount, udpEchoCount, avgDt, maxDt
+                format: "TX ch=%@ pkts=%llu keep_awake_rx=%llu | intra_dt_avg=%.2fms intra_dt_max=%.2fms",
+                activeChannelDesc, udpTxCount, keepAwakeRxCount, avgDt, maxDt
             )
             intervalSumMs = 0
             intervalCount = 0
@@ -91,6 +92,12 @@ public final class DiagnosticLogger: ObservableObject, @unchecked Sendable {
         if let s = summaryLine {
             log("PERF", s)
         }
+    }
+
+    public func recordKeepAwakePulse() {
+        os_unfair_lock_lock(&lock)
+        keepAwakeRxCount += 1
+        os_unfair_lock_unlock(&lock)
     }
 
     public func recordUdpEcho(rttMs: Int) {
@@ -122,6 +129,7 @@ public final class DiagnosticLogger: ObservableObject, @unchecked Sendable {
         os_unfair_lock_lock(&lock)
         udpTxCount = 0
         mcTxCount = 0
+        keepAwakeRxCount = 0
         intervalSumMs = 0
         intervalCount = 0
         intervalMaxMs = 0
@@ -146,9 +154,9 @@ public final class DiagnosticLogger: ObservableObject, @unchecked Sendable {
         out.append("Connected: \(client.isConnected) | Host: \(client.connectedHostName)")
         out.append("Motion Channel: \(client.activeMotionChannelName)")
         out.append("Control Channel: \(client.activeControlChannelName)")
-        out.append("Target IP: \(client.hostIP) | Candidate IPs: \(client.candidateHostIPs.joined(separator: ", "))")
+        out.append("Target IP: \(client.hostIP) | All Active UDP IPs: \(client.candidateHostIPs.joined(separator: ", "))")
         out.append("UDP Verified: \(client.isUdpVerified) (UDP RTT: \(client.udpRttMs)ms) | Control RTT: \(client.latencyMs)ms")
-        out.append("Packets Sent: UDP=\(udpTxCount), MCSession=\(mcTxCount), UDP Echoes=\(udpEchoCount)")
+        out.append("Packets Sent: Motion=\(udpTxCount), MCSession=\(mcTxCount), 802.11 KeepAwake Pulses=\(keepAwakeRxCount)")
         out.append("Dock Apps: \(client.dockApps.count) (Last Sync: \(lastDockSyncMs)ms, Cached Icons: \(client.cachedIconCount))")
         out.append("iOS Network Interfaces: \(Self.describeInterfaces())")
         out.append("")

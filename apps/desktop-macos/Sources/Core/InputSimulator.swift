@@ -4,13 +4,11 @@ import AppKit
 import os
 
 /// Ultra-Low-Latency Direct Input Engine for macOS
-/// Executes CGEventPost immediately with 0.0ms artificial buffering on normal 60Hz/120Hz frames,
-/// while coalescing sub-2ms Wi-Fi micro-bursts to protect WindowServer.
+/// Executes CGEventPost synchronously in ~55 microseconds with 0.0ms artificial timer delay.
 public final class InputSimulator: @unchecked Sendable {
     public static let shared = InputSimulator()
 
     private var lock = os_unfair_lock()
-    private let flushQueue = DispatchQueue(label: "com.aircontrol.input.flush", qos: .userInteractive)
 
     // In-memory cursor tracking
     private var cachedX: Double = 0.0
@@ -18,16 +16,9 @@ public final class InputSimulator: @unchecked Sendable {
     private var hasValidCache: Bool = false
     private var lastActivityTimestamp: UInt64 = 0
 
-    // Micro-burst coalescing (< 2.0ms window)
-    private var lastMovePostNs: UInt64 = 0
-    private var pendingDx: Double = 0.0
-    private var pendingDy: Double = 0.0
-    private var moveFlushScheduled: Bool = false
-
-    private var lastScrollPostNs: UInt64 = 0
-    private var pendingScrollX: Double = 0.0
-    private var pendingScrollY: Double = 0.0
-    private var scrollFlushScheduled: Bool = false
+    // Sub-pixel scroll remainder tracking
+    private var scrollRemX: Double = 0.0
+    private var scrollRemY: Double = 0.0
 
     // Acceleration smoothing state
     private var lastAccel: Float = 1.0
@@ -62,8 +53,8 @@ public final class InputSimulator: @unchecked Sendable {
     // MARK: - Cursor Synchronization & Display Bounds
 
     private func syncCursorPositionIfNeededLocked(now: UInt64) {
-        let elapsedNs = lastActivityTimestamp > 0 ? (now - lastActivityTimestamp) : 180_000_000
-        if !hasValidCache || elapsedNs >= 180_000_000 {
+        let elapsedNs = lastActivityTimestamp > 0 ? (now - lastActivityTimestamp) : 200_000_000
+        if !hasValidCache || elapsedNs >= 200_000_000 {
             if let sysLoc = CGEvent(source: nil)?.location {
                 cachedX = sysLoc.x
                 cachedY = sysLoc.y
@@ -72,18 +63,6 @@ public final class InputSimulator: @unchecked Sendable {
             lastAccel = 1.0
         }
         lastActivityTimestamp = now
-    }
-
-    private func flushPendingMovementLocked() -> CGPoint {
-        if abs(pendingDx) > 0.001 || abs(pendingDy) > 0.001 {
-            let rawTarget = CGPoint(x: cachedX + pendingDx, y: cachedY + pendingDy)
-            let clamped = snapToDisplayBoundsLocked(rawTarget)
-            cachedX = clamped.x
-            cachedY = clamped.y
-            pendingDx = 0.0
-            pendingDy = 0.0
-        }
-        return CGPoint(x: cachedX, y: cachedY)
     }
 
     private func snapToDisplayBoundsLocked(_ point: CGPoint) -> CGPoint {
@@ -111,14 +90,10 @@ public final class InputSimulator: @unchecked Sendable {
         return CGPoint(x: clampedX, y: clampedY)
     }
 
-    // MARK: - Zero-Latency Pointer Movement with Sub-2ms Burst Coalescing
+    // MARK: - Zero-Latency Direct Pointer Movement
 
     public func move(dx: Float, dy: Float) {
         guard dx != 0 || dy != 0 else { return }
-
-        var immediateTarget: CGPoint? = nil
-        var dragFlag: Bool = false
-        var shouldScheduleFlush: Bool = false
 
         os_unfair_lock_lock(&lock)
         let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
@@ -129,57 +104,18 @@ public final class InputSimulator: @unchecked Sendable {
         let baseGain = Self.baseMultiplier * sensitivity
         let rawAccel = baseGain * (1.0 + min(dist * 0.10, 1.8))
 
-        // Gentle EMA smoothing on the gain factor only (never delays position)
         let accel = lastAccel + 0.45 * (rawAccel - lastAccel)
         lastAccel = accel
 
-        pendingDx += Double(dx * accel)
-        pendingDy += Double(dy * accel)
-
-        // If >= 2.0ms since last post, apply 100% of delta immediately (0.0ms lag)
-        if (now - lastMovePostNs) >= 2_000_000 {
-            immediateTarget = flushPendingMovementLocked()
-            dragFlag = isDragging
-            lastMovePostNs = now
-        } else if !moveFlushScheduled {
-            moveFlushScheduled = true
-            shouldScheduleFlush = true
-        }
+        let rawTarget = CGPoint(x: cachedX + Double(dx * accel), y: cachedY + Double(dy * accel))
+        let target = snapToDisplayBoundsLocked(rawTarget)
+        cachedX = target.x
+        cachedY = target.y
+        let dragFlag = isDragging
         os_unfair_lock_unlock(&lock)
 
-        if let target = immediateTarget {
-            postMouseEvent(at: target, dragging: dragFlag)
-        } else {
-            DiagnosticLogger.shared.recordCgEventPost(durationUs: 0, coalesced: true)
-            if shouldScheduleFlush {
-                flushQueue.asyncAfter(deadline: .now() + .milliseconds(2)) { [weak self] in
-                    self?.flushCoalescedMove()
-                }
-            }
-        }
-    }
-
-    private func flushCoalescedMove() {
-        var target: CGPoint? = nil
-        var dragFlag: Bool = false
-
-        os_unfair_lock_lock(&lock)
-        moveFlushScheduled = false
-        if abs(pendingDx) > 0.001 || abs(pendingDy) > 0.001 {
-            target = flushPendingMovementLocked()
-            dragFlag = isDragging
-            lastMovePostNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-        }
-        os_unfair_lock_unlock(&lock)
-
-        if let pt = target {
-            postMouseEvent(at: pt, dragging: dragFlag)
-        }
-    }
-
-    private func postMouseEvent(at target: CGPoint, dragging: Bool) {
         let t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-        let eventType: CGEventType = dragging ? .leftMouseDragged : .mouseMoved
+        let eventType: CGEventType = dragFlag ? .leftMouseDragged : .mouseMoved
         if let event = CGEvent(
             mouseEventSource: nil,
             mouseType: eventType,
@@ -192,70 +128,32 @@ public final class InputSimulator: @unchecked Sendable {
         DiagnosticLogger.shared.recordCgEventPost(durationUs: dtUs, coalesced: false)
     }
 
-    // MARK: - Zero-Latency Scroll with Sub-3ms Burst Coalescing
+    // MARK: - Zero-Latency Scroll
 
     public func scroll(dx: Float, dy: Float) {
         guard dx != 0 || dy != 0 else { return }
 
         let scrollMultiplier: Float = isNaturalScroll ? 1.0 : -1.0
-        var immediateW1: Int32 = 0
-        var immediateW2: Int32 = 0
-        var shouldSchedule: Bool = false
-
         os_unfair_lock_lock(&lock)
-        let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-        pendingScrollX += Double(dx * scrollMultiplier * 2.2)
-        pendingScrollY += Double(dy * scrollMultiplier * 2.2)
-
-        if (now - lastScrollPostNs) >= 3_000_000 {
-            immediateW1 = Int32(pendingScrollY.rounded())
-            immediateW2 = Int32(pendingScrollX.rounded())
-            pendingScrollY -= Double(immediateW1)
-            pendingScrollX -= Double(immediateW2)
-            lastScrollPostNs = now
-        } else if !scrollFlushScheduled {
-            scrollFlushScheduled = true
-            shouldSchedule = true
-        }
-        os_unfair_lock_unlock(&lock)
-
-        if immediateW1 != 0 || immediateW2 != 0 {
-            postScrollEvent(w1: immediateW1, w2: immediateW2)
-        } else if shouldSchedule {
-            flushQueue.asyncAfter(deadline: .now() + .milliseconds(3)) { [weak self] in
-                self?.flushCoalescedScroll()
-            }
-        }
-    }
-
-    private func flushCoalescedScroll() {
-        var w1: Int32 = 0
-        var w2: Int32 = 0
-
-        os_unfair_lock_lock(&lock)
-        scrollFlushScheduled = false
-        w1 = Int32(pendingScrollY.rounded())
-        w2 = Int32(pendingScrollX.rounded())
-        pendingScrollY -= Double(w1)
-        pendingScrollX -= Double(w2)
-        lastScrollPostNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        scrollRemX += Double(dx * scrollMultiplier * 2.2)
+        scrollRemY += Double(dy * scrollMultiplier * 2.2)
+        let w1 = Int32(scrollRemY.rounded())
+        let w2 = Int32(scrollRemX.rounded())
+        scrollRemY -= Double(w1)
+        scrollRemX -= Double(w2)
         os_unfair_lock_unlock(&lock)
 
         if w1 != 0 || w2 != 0 {
-            postScrollEvent(w1: w1, w2: w2)
-        }
-    }
-
-    private func postScrollEvent(w1: Int32, w2: Int32) {
-        if let scrollEvent = CGEvent(
-            scrollWheelEvent2Source: nil,
-            units: .pixel,
-            wheelCount: 2,
-            wheel1: w1,
-            wheel2: w2,
-            wheel3: 0
-        ) {
-            scrollEvent.post(tap: .cgSessionEventTap)
+            if let scrollEvent = CGEvent(
+                scrollWheelEvent2Source: nil,
+                units: .pixel,
+                wheelCount: 2,
+                wheel1: w1,
+                wheel2: w2,
+                wheel3: 0
+            ) {
+                scrollEvent.post(tap: .cgSessionEventTap)
+            }
         }
     }
 
@@ -265,7 +163,7 @@ public final class InputSimulator: @unchecked Sendable {
         os_unfair_lock_lock(&lock)
         let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         syncCursorPositionIfNeededLocked(now: now)
-        let targetPoint = flushPendingMovementLocked()
+        let targetPoint = CGPoint(x: cachedX, y: cachedY)
         isDragging = dragging
         os_unfair_lock_unlock(&lock)
 
@@ -284,7 +182,7 @@ public final class InputSimulator: @unchecked Sendable {
         os_unfair_lock_lock(&lock)
         let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         syncCursorPositionIfNeededLocked(now: now)
-        let targetPoint = flushPendingMovementLocked()
+        let targetPoint = CGPoint(x: cachedX, y: cachedY)
         os_unfair_lock_unlock(&lock)
 
         let down = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: targetPoint, mouseButton: .left)
@@ -297,7 +195,7 @@ public final class InputSimulator: @unchecked Sendable {
         os_unfair_lock_lock(&lock)
         let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         syncCursorPositionIfNeededLocked(now: now)
-        let targetPoint = flushPendingMovementLocked()
+        let targetPoint = CGPoint(x: cachedX, y: cachedY)
         os_unfair_lock_unlock(&lock)
 
         let down1 = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: targetPoint, mouseButton: .left)
@@ -317,7 +215,7 @@ public final class InputSimulator: @unchecked Sendable {
         os_unfair_lock_lock(&lock)
         let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         syncCursorPositionIfNeededLocked(now: now)
-        let targetPoint = flushPendingMovementLocked()
+        let targetPoint = CGPoint(x: cachedX, y: cachedY)
         os_unfair_lock_unlock(&lock)
 
         let down = CGEvent(mouseEventSource: nil, mouseType: .rightMouseDown, mouseCursorPosition: targetPoint, mouseButton: .right)

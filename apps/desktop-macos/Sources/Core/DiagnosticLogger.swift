@@ -12,8 +12,8 @@ public final class DiagnosticLogger: @unchecked Sendable {
 
     // Real-time motion telemetry counters
     private var udpPacketsReceived: UInt64 = 0
-    private var mcPacketsReceived: UInt64 = 0
-    private var coalescedBursts: UInt64 = 0
+    private var tcpMotionReceived: UInt64 = 0
+    private var duplicateDropped: UInt64 = 0
     private var seqGapCount: UInt64 = 0
     private var lastSeq: UInt16 = 0
     private var hasLastSeq: Bool = false
@@ -45,7 +45,13 @@ public final class DiagnosticLogger: @unchecked Sendable {
         os_unfair_lock_unlock(&lock)
     }
 
-    public func recordMotionRx(isUdp: Bool, seq: UInt16) {
+    public func recordDuplicateDrop() {
+        os_unfair_lock_lock(&lock)
+        duplicateDropped += 1
+        os_unfair_lock_unlock(&lock)
+    }
+
+    public func recordMotionRx(isUdp: Bool, seq: UInt16, isStrokeStart: Bool) {
         let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
         var summaryLine: String? = nil
 
@@ -53,21 +59,22 @@ public final class DiagnosticLogger: @unchecked Sendable {
         if isUdp {
             udpPacketsReceived += 1
         } else {
-            mcPacketsReceived += 1
+            tcpMotionReceived += 1
         }
 
         if hasLastSeq {
             let expected = lastSeq &+ 1
-            if seq != expected && seq > expected {
+            if seq != expected && seq > expected && (seq - expected) < 1000 {
                 seqGapCount += UInt64(seq - expected)
             }
         }
         lastSeq = seq
         hasLastSeq = true
 
-        if lastRxTimeNs > 0 {
+        // Only measure intra-stroke frame intervals (ignore pauses when user lifts finger)
+        if !isStrokeStart && lastRxTimeNs > 0 {
             let deltaMs = Double(now - lastRxTimeNs) / 1_000_000.0
-            if deltaMs < 250.0 {
+            if deltaMs < 180.0 {
                 intervalSumMs += deltaMs
                 intervalCount += 1
                 if deltaMs > intervalMaxMs {
@@ -85,8 +92,8 @@ public final class DiagnosticLogger: @unchecked Sendable {
             let avgCgUs = cgPostCount > 0 ? (cgPostSumUs / Double(cgPostCount)) : 0
             let maxCgUs = cgPostMaxUs
             summaryLine = String(
-                format: "RX udp=%llu mc=%llu gaps=%llu coalesced=%llu | dt_avg=%.2fms dt_max=%.2fms | CGEvent_avg=%.0fus max=%.0fus",
-                udpPacketsReceived, mcPacketsReceived, seqGapCount, coalescedBursts,
+                format: "RX udp_win=%llu tcp_win=%llu dedup=%llu gaps=%llu | intra_dt_avg=%.2fms intra_dt_max=%.2fms | CGEvent_avg=%.0fus max=%.0fus",
+                udpPacketsReceived, tcpMotionReceived, duplicateDropped, seqGapCount,
                 avgInterval, maxInterval, avgCgUs, maxCgUs
             )
             intervalSumMs = 0
@@ -106,14 +113,10 @@ public final class DiagnosticLogger: @unchecked Sendable {
 
     public func recordCgEventPost(durationUs: Double, coalesced: Bool) {
         os_unfair_lock_lock(&lock)
-        if coalesced {
-            coalescedBursts += 1
-        } else {
-            cgPostSumUs += durationUs
-            cgPostCount += 1
-            if durationUs > cgPostMaxUs {
-                cgPostMaxUs = durationUs
-            }
+        cgPostSumUs += durationUs
+        cgPostCount += 1
+        if durationUs > cgPostMaxUs {
+            cgPostMaxUs = durationUs
         }
         os_unfair_lock_unlock(&lock)
     }
@@ -128,18 +131,18 @@ public final class DiagnosticLogger: @unchecked Sendable {
     public func statusSummary() -> [String: Any] {
         os_unfair_lock_lock(&lock)
         let udp = udpPacketsReceived
-        let mc = mcPacketsReceived
+        let tcp = tcpMotionReceived
+        let dedup = duplicateDropped
         let gaps = seqGapCount
-        let coal = coalescedBursts
         os_unfair_lock_unlock(&lock)
 
         return [
             "interfaces": Self.describeInterfaces(),
             "ax_trusted": AccessibilityManager.isTrusted,
-            "udp_rx": udp,
-            "mc_rx": mc,
+            "udp_first_wins": udp,
+            "tcp_first_wins": tcp,
+            "multipath_dedup": dedup,
             "seq_gaps": gaps,
-            "coalesced": coal,
             "mc_advertising": MultipeerServer.shared.isAdvertising
         ]
     }

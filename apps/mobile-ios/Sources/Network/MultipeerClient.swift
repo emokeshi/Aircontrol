@@ -32,7 +32,7 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
     private var netBrowser: NetServiceBrowser?
     private var resolvingServices: [NetService] = []
     private var tcpConnection: NWConnection?
-    private var udpConnection: NWConnection?
+    private var udpConnections: [String: NWConnection] = [:]
     private let socketQueue = DispatchQueue(label: "com.aircontrol.client.socket", qos: .userInteractive)
 
     @Published public var isConnected: Bool = false
@@ -56,6 +56,7 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
     private var sequenceNumber: UInt16 = 0
     private var lastUdpPongTime: TimeInterval = 0
     private var dockRequestTimestampMs: Double = 0
+    private var requestedIconBundleIds: Set<String> = []
 
     // Persistent local app icon cache (bundleId -> compressed 40x40 JPEG Base64)
     private var iconCache: [String: String] = [:]
@@ -69,8 +70,12 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
     }
 
     public var activeMotionChannelName: String {
-        if isUdpVerified {
+        if isUdpVerified && isTcpReady {
+            return "双路竞速 UDP+TCP (\(hostIP))"
+        } else if isUdpVerified {
             return "UDP直连 (\(hostIP):8920)"
+        } else if isTcpReady {
+            return "TCP直连 (\(hostIP):8921)"
         } else if connectedPeer != nil {
             return "MCSession (P2P)"
         } else {
@@ -130,6 +135,9 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
         // 1. Instant Fast-Path: Immediately dial last known Mac IP if valid LAN IP
         let savedIP = hostIP.trimmingCharacters(in: .whitespacesAndNewlines)
         if Self.isValidLanIP(savedIP) && !isTcpReady {
+            if !candidateHostIPs.contains(savedIP) {
+                candidateHostIPs.append(savedIP)
+            }
             connectDirectSockets(host: savedIP, tcpPort: 8921, udpPort: 8920)
         }
 
@@ -152,7 +160,7 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
     }
 
     public static func isValidLanIP(_ ip: String) -> Bool {
-        guard !ip.isEmpty && ip != "127.0.0.1" && !ip.hasPrefix("169.254.") && !ip.hasPrefix("198.18.") else {
+        guard !ip.isEmpty && ip != "127.0.0.1" && !ip.hasPrefix("169.254.") && !ip.hasPrefix("198.18.") && !ip.hasPrefix("10.7.") else {
             return false
         }
         return true
@@ -166,13 +174,13 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
         isSearching = false
     }
 
-    /// Once Direct LAN TCP + UDP are both verified, disconnect MCSession completely
+    /// Once Direct LAN TCP or UDP is ready, disconnect MCSession completely
     /// so iOS and macOS shut down awdl0 and stop 100ms AWDL channel hopping!
     private func shutdownRedundantMcSessionIfReady() {
-        guard isTcpReady && isUdpVerified else { return }
+        guard isTcpReady || isUdpVerified else { return }
         pauseBackgroundScanning()
         if connectedPeer != nil {
-            DiagnosticLogger.shared.log("CONN", "Direct TCP+UDP verified -> Disconnecting MCSession to shut down awdl0 radio hopping")
+            DiagnosticLogger.shared.log("CONN", "Direct LAN socket verified -> Disconnecting MCSession to shut down awdl0 radio hopping")
             connectedPeer = nil
             session?.disconnect()
         }
@@ -194,8 +202,10 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
         session?.disconnect()
         tcpConnection?.cancel()
         tcpConnection = nil
-        udpConnection?.cancel()
-        udpConnection = nil
+        for (_, udp) in udpConnections {
+            udp.cancel()
+        }
+        udpConnections.removeAll()
         stopPingLoop()
         reconnectTimer?.invalidate()
         reconnectTimer = nil
@@ -251,7 +261,6 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
                     self.connectDirectSockets(host: ip, tcpPort: 8921, udpPort: 8920)
                 }
             } else if !self.isUdpVerified {
-                // Keep probing UDP or trying alternate candidate LAN IPs if UDP isn't verified yet
                 self.sendUdpEchoProbe()
             }
         }
@@ -318,7 +327,7 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
         }
     }
 
-    // MARK: - Direct WMM UDP + TCP_NODELAY Socket Engine
+    // MARK: - Direct WMM UDP + TCP_NODELAY Socket Engine (VPN Bypass + Multi-IP Racing)
 
     public func netServiceBrowser(_ browser: NetServiceBrowser, didFind service: NetService, moreComing: Bool) {
         service.delegate = self
@@ -350,20 +359,26 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
         guard let firstIP = resolvedIPs.first else { return }
         DispatchQueue.main.async {
             DiagnosticLogger.shared.log("BONJOUR", "Resolved '\(sender.name)' -> IPs: \(resolvedIPs.joined(separator: ", "))")
-            self.candidateHostIPs = resolvedIPs
+            for ip in resolvedIPs {
+                if !self.candidateHostIPs.contains(ip) {
+                    self.candidateHostIPs.append(ip)
+                }
+                self.ensureUdpChannel(host: ip, port: 8920)
+            }
             if !self.isTcpReady {
                 self.connectDirectSockets(host: firstIP, tcpPort: UInt16(sender.port), udpPort: 8920)
             }
         }
     }
 
-    private func setupUdpChannel(host: String, port: UInt16 = 8920) {
+    private func ensureUdpChannel(host: String, port: UInt16 = 8920) {
         guard Self.isValidLanIP(host) else { return }
-        udpConnection?.cancel()
-        isUdpVerified = false
+        if udpConnections[host] != nil { return }
 
         let udpParams = NWParameters.udp
-        // 802.11e WMM Voice/Video QoS tag to bypass Wi-Fi router packet aggregation jitter
+        // Force physical Wi-Fi interface (en0) on iOS, bypassing VPN utun5 (10.7.1.1) and Cellular pdp_ip0!
+        udpParams.requiredInterfaceType = .wifi
+        udpParams.prohibitedInterfaceTypes = [.other, .cellular]
         udpParams.serviceClass = .interactiveVideo
 
         let udpEndpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!)
@@ -371,17 +386,20 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
         udp.stateUpdateHandler = { [weak self, weak udp] state in
             guard let self = self, let udp = udp else { return }
             if case .ready = state {
-                self.receiveUdpEchoLoop(from: udp)
+                self.receiveUdpEchoLoop(from: udp, host: host)
                 self.sendUdpEchoProbe()
+            } else if case .failed = state {
+                DispatchQueue.main.async {
+                    self.udpConnections.removeValue(forKey: host)
+                }
             }
         }
         udp.start(queue: socketQueue)
-        self.udpConnection = udp
-        DiagnosticLogger.shared.log("UDP", "Initialized UDP channel to \(host):\(port), sending echo probe...")
+        self.udpConnections[host] = udp
+        DiagnosticLogger.shared.log("UDP", "Initialized Wi-Fi Direct UDP channel to \(host):\(port) (utun bypassed)")
     }
 
     private func sendUdpEchoProbe() {
-        guard let udp = udpConnection else { return }
         let nowMs = UInt64(Date().timeIntervalSince1970 * 1000)
         var probe = Data(count: 16)
         probe.withUnsafeMutableBytes { raw in
@@ -390,33 +408,45 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
             ptr.storeBytes(of: UInt8(0xFE), toByteOffset: 1, as: UInt8.self)
             ptr.storeBytes(of: nowMs.bigEndian, toByteOffset: 8, as: UInt64.self)
         }
-        udp.send(content: probe, completion: .idempotent)
+        for (_, udp) in udpConnections {
+            udp.send(content: probe, completion: .idempotent)
+        }
     }
 
-    private func receiveUdpEchoLoop(from connection: NWConnection) {
+    private func receiveUdpEchoLoop(from connection: NWConnection, host: String) {
         connection.receiveMessage { [weak self, weak connection] content, _, _, error in
             guard let self = self, let connection = connection, error == nil else { return }
-            if let data = content, data.count >= 16, data[0] == 0xA8, data[1] == 0xFF {
-                let sentMs = data.withUnsafeBytes { raw -> UInt64 in
-                    guard let ptr = raw.baseAddress else { return 0 }
-                    return UInt64(bigEndian: ptr.load(fromByteOffset: 8, as: UInt64.self))
-                }
-                let nowMs = UInt64(Date().timeIntervalSince1970 * 1000)
-                let rtt = sentMs > 0 && nowMs >= sentMs ? Int(nowMs - sentMs) : 1
-                DispatchQueue.main.async {
-                    let wasVerified = self.isUdpVerified
-                    self.isUdpVerified = true
-                    self.lastUdpPongTime = ProcessInfo.processInfo.systemUptime
-                    self.udpRttMs = max(1, min(rtt, 999))
-                    self.latencyMs = self.udpRttMs
-                    DiagnosticLogger.shared.recordUdpEcho(rttMs: self.udpRttMs)
-                    if !wasVerified {
-                        DiagnosticLogger.shared.log("UDP", "UDP Direct VERIFIED (\(self.hostIP):8920, RTT=\(self.udpRttMs)ms)")
-                        self.shutdownRedundantMcSessionIfReady()
+            if let data = content, data.count >= 4, data[0] == 0xA8 {
+                let subType = data[1]
+                if subType == 0xFD {
+                    // 802.11 PM=0 Radio Keep-Awake pulse from Mac during active mouse movement
+                    DiagnosticLogger.shared.recordKeepAwakePulse()
+                    DispatchQueue.main.async {
+                        self.lastUdpPongTime = ProcessInfo.processInfo.systemUptime
+                        self.isUdpVerified = true
+                    }
+                } else if subType == 0xFF && data.count >= 16 {
+                    let sentMs = data.withUnsafeBytes { raw -> UInt64 in
+                        guard let ptr = raw.baseAddress else { return 0 }
+                        return UInt64(bigEndian: ptr.load(fromByteOffset: 8, as: UInt64.self))
+                    }
+                    let nowMs = UInt64(Date().timeIntervalSince1970 * 1000)
+                    let rtt = sentMs > 0 && nowMs >= sentMs ? Int(nowMs - sentMs) : 1
+                    DispatchQueue.main.async {
+                        let wasVerified = self.isUdpVerified
+                        self.isUdpVerified = true
+                        self.lastUdpPongTime = ProcessInfo.processInfo.systemUptime
+                        self.udpRttMs = max(1, min(rtt, 999))
+                        self.latencyMs = self.udpRttMs
+                        DiagnosticLogger.shared.recordUdpEcho(rttMs: self.udpRttMs)
+                        if !wasVerified {
+                            DiagnosticLogger.shared.log("UDP", "UDP Direct VERIFIED (\(host):8920, RTT=\(self.udpRttMs)ms)")
+                            self.shutdownRedundantMcSessionIfReady()
+                        }
                     }
                 }
             }
-            self.receiveUdpEchoLoop(from: connection)
+            self.receiveUdpEchoLoop(from: connection, host: host)
         }
     }
 
@@ -425,7 +455,7 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
         self.hostIP = host
         UserDefaults.standard.set(host, forKey: "aircontrol_saved_host_ip")
 
-        setupUdpChannel(host: host, port: udpPort)
+        ensureUdpChannel(host: host, port: udpPort)
 
         guard tcpConnection == nil else { return }
 
@@ -433,11 +463,14 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
         tcpOptions.noDelay = true
         tcpOptions.connectionTimeout = 3
         let tcpParams = NWParameters(tls: nil, tcp: tcpOptions)
+        // Force physical Wi-Fi interface (en0) on iOS, bypassing VPN utun5 and Cellular pdp_ip0!
+        tcpParams.requiredInterfaceType = .wifi
+        tcpParams.prohibitedInterfaceTypes = [.other, .cellular]
         tcpParams.serviceClass = .interactiveVideo
 
         let tcpEndpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: tcpPort)!)
         let tcp = NWConnection(to: tcpEndpoint, using: tcpParams)
-        DiagnosticLogger.shared.log("TCP", "Dialing Direct TCP \(host):\(tcpPort)...")
+        DiagnosticLogger.shared.log("TCP", "Dialing Direct TCP \(host):\(tcpPort) (utun bypassed)...")
 
         tcp.stateUpdateHandler = { [weak self, weak tcp] state in
             guard let self = self, let tcp = tcp else { return }
@@ -447,6 +480,8 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
                     DiagnosticLogger.shared.log("TCP", "Direct TCP READY (\(host):\(tcpPort))")
                     self.isTcpReady = true
                     self.isConnected = true
+                    self.hostIP = host
+                    UserDefaults.standard.set(host, forKey: "aircontrol_saved_host_ip")
                     self.pauseBackgroundScanning()
                     self.startPingLoop()
                     self.sendJson(["type": "client_hello", "client_name": UIDevice.current.name])
@@ -536,22 +571,27 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
                     self.connectedHostName = hostName
                     UserDefaults.standard.set(hostName, forKey: "aircontrol_saved_host_name")
                 }
+                let udpPort = UInt16(json["udp_port"] as? Int ?? 8920)
+                let tcpPort = UInt16(json["tcp_port"] as? Int ?? 8921)
+
                 if let ips = json["local_ips"] as? [String] {
                     let valid = ips.filter { Self.isValidLanIP($0) }
-                    if !valid.isEmpty {
-                        self.candidateHostIPs = valid
+                    for ip in valid {
+                        if !self.candidateHostIPs.contains(ip) {
+                            self.candidateHostIPs.append(ip)
+                        }
+                        // Open parallel UDP channels to ALL Mac LAN IPs (e.g. en3 Wired Ethernet 192.168.0.103 + en0 Wi-Fi 192.168.0.101)!
+                        self.ensureUdpChannel(host: ip, port: udpPort)
                     }
                 }
                 if let ip = json["local_ip"] as? String, Self.isValidLanIP(ip) {
-                    let udpPort = UInt16(json["udp_port"] as? Int ?? 8920)
-                    let tcpPort = UInt16(json["tcp_port"] as? Int ?? 8921)
-                    if self.hostIP != ip || !self.isTcpReady {
-                        self.hostIP = ip
-                        UserDefaults.standard.set(ip, forKey: "aircontrol_saved_host_ip")
-                        // Upgrade both TCP & UDP to Direct LAN sockets so we can retire MCSession (awdl0)
+                    if !self.candidateHostIPs.contains(ip) {
+                        self.candidateHostIPs.insert(ip, at: 0)
+                    }
+                    self.ensureUdpChannel(host: ip, port: udpPort)
+                    // Only dial TCP if TCP isn't already connected! Never tear down an already-working en3 TCP connection!
+                    if !self.isTcpReady {
                         self.connectDirectSockets(host: ip, tcpPort: tcpPort, udpPort: udpPort)
-                    } else if !self.isUdpVerified {
-                        self.setupUdpChannel(host: ip, port: udpPort)
                     }
                 }
                 if let mac = json["mac_address"] as? String, !mac.isEmpty {
@@ -587,8 +627,9 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
                             self.iconCache[bid] = provided
                         } else if let cached = self.iconCache[bid] {
                             icon = cached
-                        } else if !bid.isEmpty {
+                        } else if !bid.isEmpty && !self.requestedIconBundleIds.contains(bid) {
                             missingIconBundleIds.append(bid)
+                            self.requestedIconBundleIds.insert(bid)
                         }
                         return RemoteApp(bundleId: bid, name: name, isActive: active, iconBase64: icon)
                     }
@@ -608,6 +649,7 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
                 if let iconsDict = json["icons"] as? [String: String], !iconsDict.isEmpty {
                     for (bid, base64) in iconsDict {
                         self.iconCache[bid] = base64
+                        self.requestedIconBundleIds.remove(bid)
                     }
                     self.dockApps = self.dockApps.map { app in
                         var copy = app
@@ -649,12 +691,16 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
         sendJson(["type": "host_logs_get"])
     }
 
-    // MARK: - WMM High-Priority Motion Channel
+    // MARK: - Multi-Path Racing Motion Channel (Wired Ethernet UDP + Wi-Fi UDP + TCP_NODELAY)
 
-    private func sendMotionPacket(eventType: UInt8, dx: Float, dy: Float, fingers: UInt16 = 1, flags: UInt16 = 0) {
+    private func sendMotionPacket(eventType: UInt8, dx: Float, dy: Float, fingers: UInt16 = 1, flags: UInt16 = 0, isStrokeStart: Bool = false) {
         guard isConnected else { return }
 
         sequenceNumber = sequenceNumber &+ 1
+        var finalFlags = flags
+        if isStrokeStart {
+            finalFlags |= 0x80
+        }
 
         var buffer = Data(count: 16)
         buffer.withUnsafeMutableBytes { raw in
@@ -665,47 +711,64 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
             ptr.storeBytes(of: dx.bitPattern.bigEndian, toByteOffset: 4, as: UInt32.self)
             ptr.storeBytes(of: dy.bitPattern.bigEndian, toByteOffset: 8, as: UInt32.self)
             ptr.storeBytes(of: fingers.bigEndian, toByteOffset: 12, as: UInt16.self)
-            ptr.storeBytes(of: flags.bigEndian, toByteOffset: 14, as: UInt16.self)
+            ptr.storeBytes(of: finalFlags.bigEndian, toByteOffset: 14, as: UInt16.self)
         }
 
-        // Only use direct UDP when verified by active UDP echo handshake!
-        // Never send into an unverified UDP blackhole.
-        if isUdpVerified, let udp = udpConnection {
-            udp.send(content: buffer, completion: .idempotent)
-            DiagnosticLogger.shared.recordMotionTx(viaUdp: true, activeChannelDesc: "UDP(\(hostIP))")
-        } else if let peer = connectedPeer, session != nil {
-            try? session.send(buffer, toPeers: [peer], with: .unreliable)
-            DiagnosticLogger.shared.recordMotionTx(viaUdp: false, activeChannelDesc: "MCSession")
-            // Also send on UDP if available to trigger verification without losing the packet
-            if let udp = udpConnection {
+        var sentViaLan = false
+
+        // 1. Blast across ALL active UDP LAN channels (e.g. en3 Wired Ethernet 192.168.0.103 + en0 Wi-Fi 192.168.0.101)
+        if !udpConnections.isEmpty {
+            for (_, udp) in udpConnections {
                 udp.send(content: buffer, completion: .idempotent)
             }
-        } else if let udp = udpConnection {
-            udp.send(content: buffer, completion: .idempotent)
-            DiagnosticLogger.shared.recordMotionTx(viaUdp: true, activeChannelDesc: "UDP-Unverified(\(hostIP))")
+            sentViaLan = true
+        }
+
+        // 2. Simultaneously race on the TCP_NODELAY socket (192.168.0.103:8921) — Mac deduplicates by sequenceNumber!
+        if isTcpReady, let tcp = tcpConnection {
+            var length = UInt32(16).bigEndian
+            var tcpPacket = Data(bytes: &length, count: 4)
+            tcpPacket.append(buffer)
+            tcp.send(content: tcpPacket, completion: .idempotent)
+            sentViaLan = true
+        }
+
+        if sentViaLan {
+            DiagnosticLogger.shared.recordMotionTx(
+                viaUdp: true,
+                activeChannelDesc: "MultiPath(\(hostIP))",
+                isStrokeStart: isStrokeStart
+            )
+        } else if let peer = connectedPeer, session != nil {
+            try? session.send(buffer, toPeers: [peer], with: .unreliable)
+            DiagnosticLogger.shared.recordMotionTx(
+                viaUdp: false,
+                activeChannelDesc: "MCSession",
+                isStrokeStart: isStrokeStart
+            )
         }
     }
 
-    public func sendMove(dx: Float, dy: Float) {
-        sendMotionPacket(eventType: 0x01, dx: dx, dy: dy, fingers: 1)
+    public func sendMove(dx: Float, dy: Float, isStrokeStart: Bool = false) {
+        sendMotionPacket(eventType: 0x01, dx: dx, dy: dy, fingers: 1, isStrokeStart: isStrokeStart)
     }
 
-    public func sendScroll(dx: Float, dy: Float) {
-        sendMotionPacket(eventType: 0x02, dx: dx, dy: dy, fingers: 2)
+    public func sendScroll(dx: Float, dy: Float, isStrokeStart: Bool = false) {
+        sendMotionPacket(eventType: 0x02, dx: dx, dy: dy, fingers: 2, isStrokeStart: isStrokeStart)
     }
 
-    public func sendDrag(dx: Float, dy: Float) {
-        sendMotionPacket(eventType: 0x03, dx: dx, dy: dy, flags: 0x01)
+    public func sendDrag(dx: Float, dy: Float, isStrokeStart: Bool = false) {
+        sendMotionPacket(eventType: 0x03, dx: dx, dy: dy, flags: 0x01, isStrokeStart: isStrokeStart)
     }
 
     public func sendClick(isRight: Bool = false, isDouble: Bool = false) {
         var flags: UInt16 = isRight ? 0x02 : 0x01
         if isDouble { flags |= 0x08 }
-        sendMotionPacket(eventType: 0x04, dx: 0, dy: 0, flags: flags)
+        sendMotionPacket(eventType: 0x04, dx: 0, dy: 0, flags: flags, isStrokeStart: true)
     }
 
     public func sendDragRelease() {
-        sendMotionPacket(eventType: 0x05, dx: 0, dy: 0)
+        sendMotionPacket(eventType: 0x05, dx: 0, dy: 0, isStrokeStart: true)
     }
 
     // MARK: - Control Channel
@@ -713,8 +776,6 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
     private func sendJson(_ object: [String: Any]) {
         guard isConnected, let data = try? JSONSerialization.data(withJSONObject: object) else { return }
 
-        // Strictly check isTcpReady before sending on tcpConnection!
-        // Never drop control packets into a still-preparing TCP connection when MCSession is already connected.
         if isTcpReady, let tcp = tcpConnection {
             var length = UInt32(data.count).bigEndian
             var packet = Data(bytes: &length, count: 4)
@@ -733,9 +794,7 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
             self.sendJson(["type": "ping", "client_time": now])
             self.sendUdpEchoProbe()
 
-            // If UDP hasn't echoed in > 4.5s, mark unverified so we fall back cleanly
-            if self.isUdpVerified && (ProcessInfo.processInfo.systemUptime - self.lastUdpPongTime) > 4.5 {
-                DiagnosticLogger.shared.log("UDP", "UDP echo timeout (>4.5s), marking unverified")
+            if self.isUdpVerified && (ProcessInfo.processInfo.systemUptime - self.lastUdpPongTime) > 5.0 {
                 self.isUdpVerified = false
             }
         }
