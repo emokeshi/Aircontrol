@@ -204,6 +204,8 @@ public final class MultipeerServer: NSObject, @unchecked Sendable, MCSessionDele
             guard let action = json["action"] as? String else { return }
             DispatchQueue.main.async {
                 switch action {
+                case "wake_display":
+                    SystemController.shared.wakeDisplay()
                 case "lock_screen":
                     SystemController.shared.lockScreen()
                 case "display_sleep":

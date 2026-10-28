@@ -21,13 +21,16 @@ jobs:
       - name: Publish GitHub Release Assets
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v1.3.1' }}
-          name: "AirControl v1.3.1"
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v1.3.2' }}
+          name: "AirControl v1.3.2"
           body: |
-            ### AirControl v1.3.1 更新内容
+            ### AirControl v1.3.2 更新内容
             - **电脑端 (`AirControl-macOS.zip`)**：解压后打开 `AirControl.app`，点击顶部菜单栏图标即可使用。
             - **手机端 (`AirControl.ipa`)**：支持 SideStore、AltStore、TrollStore 或爱思助手安装，已补齐 iOS 桌面图标。
-            - **核心改进**：修复中文拼音输入（全拼/九宫格/手写）只出英文字母的问题，修复 iOS 键盘语音输入只录一个字就自动暂停的问题；修复移动卡顿与单指误触拖拽。
+            - **核心改进**：
+              1. 解决纯 Wi-Fi 环境下半双工碰撞与微突发导致的指针卡顿（启用 802.11e WMM 语音级单路 UDP + 250Hz 抗抖动插值引擎）；
+              2. 修复唤醒失败（支持息屏后直接亮屏 + 绑定 `en0` 子网广播唤醒）及睡眠/锁屏/重启/关机全部电源动作；
+              3. 优化键盘输入框体验：支持拼音与连续语音输入，点击「发送」后自动清空输入框。
           files: |
             dist/AirControl-macOS.zip
             dist/AirControl.ipa

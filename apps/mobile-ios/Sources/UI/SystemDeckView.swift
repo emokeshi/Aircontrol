@@ -23,7 +23,11 @@ public struct SystemDeckView: View {
     private func triggerWakeOnLAN() {
         haptic.impactOccurred()
         let mac = client.targetMacAddress.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !mac.isEmpty else {
+
+        // Always wake the Mac display immediately if connected (e.g. after 息屏)
+        client.wakeDisplay()
+
+        if !client.isConnected && WakeOnLAN.parseMacAddress(mac) == nil {
             editableMac = ""
             showingMacEditor = true
             return
@@ -33,14 +37,18 @@ public struct SystemDeckView: View {
             switch result {
             case .success:
                 notificationHaptic.notificationOccurred(.success)
-                alertTitle = "已发送唤醒指令"
-                alertMessage = "目标物理地址: \(mac)"
-                showingInfoAlert = true
+                if !client.isConnected {
+                    alertTitle = "已发送唤醒指令"
+                    alertMessage = "目标物理地址: \(mac)"
+                    showingInfoAlert = true
+                }
             case .failure(let err):
-                notificationHaptic.notificationOccurred(.error)
-                alertTitle = "唤醒失败"
-                alertMessage = err.localizedDescription
-                showingInfoAlert = true
+                if !client.isConnected {
+                    notificationHaptic.notificationOccurred(.error)
+                    alertTitle = "唤醒失败"
+                    alertMessage = err.localizedDescription
+                    showingInfoAlert = true
+                }
             }
         }
     }

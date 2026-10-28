@@ -3,6 +3,8 @@ import AppKit
 import CoreAudio
 import AudioToolbox
 import ServiceManagement
+import IOKit
+import IOKit.pwr_mgt
 import Darwin
 
 public final class SystemController: @unchecked Sendable {
@@ -319,8 +321,27 @@ public final class SystemController: @unchecked Sendable {
 
     // MARK: - Power & Display Management
 
+    /// Wakes a sleeping Mac display (e.g. after `pmset displaysleepnow` / 息屏)
+    public func wakeDisplay() {
+        var assertionID: IOPMAssertionID = 0
+        IOPMAssertionDeclareUserActivity(
+            "AirControl Wake Display" as CFString,
+            kIOPMUserActiveLocal,
+            &assertionID
+        )
+
+        let task = Process()
+        task.launchPath = "/usr/bin/caffeinate"
+        task.arguments = ["-u", "-t", "2"]
+        try? task.run()
+
+        // Nudge cursor by 1px and back so macOS WindowServer immediately lights up the display
+        InputSimulator.shared.move(dx: 1, dy: 0)
+        InputSimulator.shared.move(dx: -1, dy: 0)
+    }
+
     public func lockScreen() {
-        // SACLockScreenImmediate dynamic resolution
+        // 1. Primary: SACLockScreenImmediate in login.framework
         typealias SACLockScreenImmediateFunc = @convention(c) () -> Void
         if let handle = dlopen("/System/Library/PrivateFrameworks/login.framework/Versions/Current/login", RTLD_LAZY) {
             defer { dlclose(handle) }
@@ -331,8 +352,10 @@ public final class SystemController: @unchecked Sendable {
             }
         }
 
-        // Fallback: put display to sleep
-        displaySleep()
+        // 2. Secondary: Native macOS Lock Screen shortcut (⌃⌘Q, keyCode 12 = 'q')
+        let mods = KeyboardSimulator.Modifiers(cmd: true, opt: false, ctrl: true, shift: false)
+        KeyboardSimulator.shared.postKeyEvent(keyCode: 12, isDown: true, modifiers: mods)
+        KeyboardSimulator.shared.postKeyEvent(keyCode: 12, isDown: false, modifiers: mods)
     }
 
     public func displaySleep() {
@@ -343,21 +366,50 @@ public final class SystemController: @unchecked Sendable {
     }
 
     public func systemSleep() {
-        // Put Mac into low-power sleep state (0.5W standby)
-        let script = NSAppleScript(source: "tell application \"System Events\" to sleep")
-        script?.executeAndReturnError(nil)
+        // 1. Primary: /usr/bin/pmset sleepnow (works without AppleEvents TCC permission!)
+        let task = Process()
+        task.launchPath = "/usr/bin/pmset"
+        task.arguments = ["sleepnow"]
+        try? task.run()
+
+        // 2. Secondary: Direct IOKit Power Management sleep call
+        let port = IOPMFindPowerManagement(kIOMainPortDefault)
+        if port != 0 {
+            IOPMSleepSystem(port)
+            IOServiceClose(port)
+        }
+    }
+
+    private func sendLoginWindowEvent(_ eventID: AEEventID) -> Bool {
+        let target = NSAppleEventDescriptor(bundleIdentifier: "com.apple.loginwindow")
+        let event = NSAppleEventDescriptor.appleEvent(
+            withEventClass: kCoreEventClass,
+            eventID: eventID,
+            targetDescriptor: target,
+            returnID: AEReturnID(kAutoGenerateReturnID),
+            transactionID: AETransactionID(kAnyTransactionID)
+        )
+        var reply = AppleEvent()
+        let status = AESendMessage(event.aeDesc, &reply, AESendMode(kAENoReply), kAEDefaultTimeout)
+        return status == noErr
     }
 
     public func shutdown() {
-        // Safe shutdown via System Events
-        let script = NSAppleScript(source: "tell application \"System Events\" to shut down")
-        script?.executeAndReturnError(nil)
+        if !sendLoginWindowEvent(AEEventID(kAEShutDown)) {
+            let task = Process()
+            task.launchPath = "/usr/bin/osascript"
+            task.arguments = ["-e", "tell application \"System Events\" to shut down"]
+            try? task.run()
+        }
     }
 
     public func restart() {
-        // Safe restart via System Events
-        let script = NSAppleScript(source: "tell application \"System Events\" to restart")
-        script?.executeAndReturnError(nil)
+        if !sendLoginWindowEvent(AEEventID(kAERestart)) {
+            let task = Process()
+            task.launchPath = "/usr/bin/osascript"
+            task.arguments = ["-e", "tell application \"System Events\" to restart"]
+            try? task.run()
+        }
     }
 
     // MARK: - Hardware MAC Address Discovery

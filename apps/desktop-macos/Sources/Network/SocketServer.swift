@@ -10,7 +10,8 @@ public final class SocketServer: @unchecked Sendable {
     private var udpListener: NWListener?
     private var netService: NetService?
     private var activeTcpConnection: NWConnection?
-    private let queue = DispatchQueue(label: "com.aircontrol.socket.server", qos: .userInteractive)
+    private let udpQueue = DispatchQueue(label: "com.aircontrol.socket.udp", qos: .userInteractive)
+    private let tcpQueue = DispatchQueue(label: "com.aircontrol.socket.tcp", qos: .userInteractive)
 
     public private(set) var isRunning: Bool = false
     public var tcpPort: UInt16 = 8921
@@ -85,7 +86,7 @@ public final class SocketServer: @unchecked Sendable {
     private func startUdp(port: UInt16) {
         let params = NWParameters.udp
         params.allowLocalEndpointReuse = true
-        params.serviceClass = .interactiveVideo
+        params.serviceClass = .interactiveVoice
         // Bypass virtual VPN TUN interfaces (utun) which have interface type .other
         params.prohibitedInterfaceTypes = [.other]
 
@@ -94,12 +95,12 @@ public final class SocketServer: @unchecked Sendable {
         listener.newConnectionHandler = { [weak self] connection in
             self?.handleUdpConnection(connection)
         }
-        listener.start(queue: queue)
+        listener.start(queue: udpQueue)
         self.udpListener = listener
     }
 
     private func handleUdpConnection(_ connection: NWConnection) {
-        connection.start(queue: queue)
+        connection.start(queue: udpQueue)
         func receiveNext() {
             connection.receiveMessage { [weak self, weak connection] content, _, _, error in
                 guard let self = self, let connection = connection, let data = content, error == nil else {
@@ -118,10 +119,10 @@ public final class SocketServer: @unchecked Sendable {
                         }
                     } else {
                         self.processMotionPacket(data, isUdp: true)
-                        // Send a 4-byte 802.11 PM=0 Radio Keep-Awake pulse every 20ms during active motion
-                        // so neither Mac nor iPhone Wi-Fi enters 102.4ms 802.11 PS-Poll Beacon sleep!
+                        // Send a 4-byte 802.11 PM=0 Radio Keep-Awake pulse every 150ms during active motion
+                        // (keeps en0 awake without creating half-duplex reverse Wi-Fi collisions)
                         let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-                        if (now - self.lastKeepAwakeReplyNs) >= 20_000_000 {
+                        if (now - self.lastKeepAwakeReplyNs) >= 150_000_000 {
                             self.lastKeepAwakeReplyNs = now
                             let keepAwake = Data([0xA8, 0xFD, data[2], data[3]])
                             connection.send(content: keepAwake, completion: .idempotent)
@@ -193,6 +194,8 @@ public final class SocketServer: @unchecked Sendable {
                 InputSimulator.shared.setDragging(false)
             case 0x06:
                 InputSimulator.shared.setDragging(true)
+            case 0x07:
+                SystemController.shared.wakeDisplay()
             default:
                 break
             }
@@ -209,7 +212,7 @@ public final class SocketServer: @unchecked Sendable {
 
         let params = NWParameters(tls: nil, tcp: tcpOptions)
         params.allowLocalEndpointReuse = true
-        params.serviceClass = .interactiveVideo
+        params.serviceClass = .interactiveVoice
         params.prohibitedInterfaceTypes = [.other]
 
         guard let listener = try? NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!) else { return }
@@ -217,7 +220,7 @@ public final class SocketServer: @unchecked Sendable {
         listener.newConnectionHandler = { [weak self] connection in
             self?.handleTcpConnection(connection)
         }
-        listener.start(queue: queue)
+        listener.start(queue: tcpQueue)
         self.tcpListener = listener
     }
 
@@ -247,7 +250,7 @@ public final class SocketServer: @unchecked Sendable {
             }
         }
 
-        connection.start(queue: queue)
+        connection.start(queue: tcpQueue)
 
         func readMessage() {
             connection.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self, weak connection] lengthData, _, _, error in
@@ -435,6 +438,8 @@ public final class SocketServer: @unchecked Sendable {
             guard let action = json["action"] as? String else { return }
             DispatchQueue.main.async {
                 switch action {
+                case "wake_display":
+                    SystemController.shared.wakeDisplay()
                 case "lock_screen":
                     SystemController.shared.lockScreen()
                 case "display_sleep":

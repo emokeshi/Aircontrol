@@ -70,10 +70,8 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
     }
 
     public var activeMotionChannelName: String {
-        if isUdpVerified && isTcpReady {
-            return "双路竞速 UDP+TCP (\(hostIP))"
-        } else if isUdpVerified {
-            return "UDP直连 (\(hostIP):8920)"
+        if isUdpVerified {
+            return "UDP语音级直连 (\(hostIP):8920)"
         } else if isTcpReady {
             return "TCP直连 (\(hostIP):8921)"
         } else if connectedPeer != nil {
@@ -398,9 +396,10 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
 
         let udpParams = NWParameters.udp
         // Force physical Wi-Fi interface (en0) on iOS, bypassing VPN utun5 (10.7.1.1) and Cellular pdp_ip0!
+        // Use .interactiveVoice (802.11e WMM AC_VO: CWmin=3, CWmax=7, zero A-MPDU aggregation delay)
         udpParams.requiredInterfaceType = .wifi
         udpParams.prohibitedInterfaceTypes = [.other, .cellular]
-        udpParams.serviceClass = .interactiveVideo
+        udpParams.serviceClass = .interactiveVoice
 
         let udpEndpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!)
         let udp = NWConnection(to: udpEndpoint, using: udpParams)
@@ -496,7 +495,7 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
         // Force physical Wi-Fi interface (en0) on iOS, bypassing VPN utun5 and Cellular pdp_ip0!
         tcpParams.requiredInterfaceType = .wifi
         tcpParams.prohibitedInterfaceTypes = [.other, .cellular]
-        tcpParams.serviceClass = .interactiveVideo
+        tcpParams.serviceClass = .interactiveVoice
 
         let tcpEndpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: tcpPort)!)
         let tcp = NWConnection(to: tcpEndpoint, using: tcpParams)
@@ -606,20 +605,25 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
 
                 if let ips = json["local_ips"] as? [String] {
                     let valid = ips.filter { Self.isValidLanIP($0) }
-                    for ip in valid {
-                        if !self.candidateHostIPs.contains(ip) {
-                            self.candidateHostIPs.append(ip)
+                    if !valid.isEmpty {
+                        // Prune any unplugged/stale Mac IPs (e.g. if wired en3 was unplugged) so we never ARP-spam dead IPs on Wi-Fi
+                        for existingIP in Array(self.udpConnections.keys) where !valid.contains(existingIP) {
+                            self.udpConnections[existingIP]?.cancel()
+                            self.udpConnections.removeValue(forKey: existingIP)
                         }
-                        // Open parallel UDP channels to ALL Mac LAN IPs (e.g. en3 Wired Ethernet 192.168.0.103 + en0 Wi-Fi 192.168.0.101)!
-                        self.ensureUdpChannel(host: ip, port: udpPort)
+                        self.candidateHostIPs = valid
+                        for ip in valid {
+                            self.ensureUdpChannel(host: ip, port: udpPort)
+                        }
                     }
                 }
                 if let ip = json["local_ip"] as? String, Self.isValidLanIP(ip) {
+                    self.hostIP = ip
+                    UserDefaults.standard.set(ip, forKey: "aircontrol_saved_host_ip")
                     if !self.candidateHostIPs.contains(ip) {
                         self.candidateHostIPs.insert(ip, at: 0)
                     }
                     self.ensureUdpChannel(host: ip, port: udpPort)
-                    // Only dial TCP if TCP isn't already connected! Never tear down an already-working en3 TCP connection!
                     if !self.isTcpReady {
                         self.connectDirectSockets(host: ip, tcpPort: tcpPort, udpPort: udpPort)
                     }
@@ -746,29 +750,34 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
             ptr.storeBytes(of: finalFlags.bigEndian, toByteOffset: 14, as: UInt16.self)
         }
 
-        var sentViaLan = false
+        var sentViaUdp = false
+        var sentViaTcp = false
 
-        // 1. Blast across ALL active UDP LAN channels (e.g. en3 Wired Ethernet 192.168.0.103 + en0 Wi-Fi 192.168.0.101)
-        if !udpConnections.isEmpty {
+        // 1. Primary: WMM Voice (AC_VO) UDP to the active host IP (zero TCP ACK reverse-path Wi-Fi collisions!)
+        if let primaryUdp = udpConnections[hostIP] {
+            primaryUdp.send(content: buffer, completion: .idempotent)
+            sentViaUdp = true
+        } else if !udpConnections.isEmpty {
             for (_, udp) in udpConnections {
                 udp.send(content: buffer, completion: .idempotent)
             }
-            sentViaLan = true
+            sentViaUdp = true
         }
 
-        // 2. Simultaneously race on the TCP_NODELAY socket (192.168.0.103:8921) — Mac deduplicates by sequenceNumber!
-        if isTcpReady, let tcp = tcpConnection {
+        // 2. Fallback: Only send motion over TCP_NODELAY if UDP has not yet been verified!
+        //    (Avoids duplicating 60Hz packets + reverse TCP ACKs over half-duplex Wi-Fi once UDP is verified)
+        if !isUdpVerified, isTcpReady, let tcp = tcpConnection {
             var length = UInt32(16).bigEndian
             var tcpPacket = Data(bytes: &length, count: 4)
             tcpPacket.append(buffer)
             tcp.send(content: tcpPacket, completion: .idempotent)
-            sentViaLan = true
+            sentViaTcp = true
         }
 
-        if sentViaLan {
+        if sentViaUdp || sentViaTcp {
             DiagnosticLogger.shared.recordMotionTx(
-                viaUdp: true,
-                activeChannelDesc: "MultiPath(\(hostIP))",
+                viaUdp: sentViaUdp,
+                activeChannelDesc: sentViaUdp ? "UDP(\(hostIP))" : "TCP(\(hostIP))",
                 isStrokeStart: isStrokeStart
             )
         } else if let peer = connectedPeer, session != nil {
@@ -917,6 +926,11 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
         sendJson(["type": "app_terminate", "bundle_id": bundleId])
     }
 
+    public func wakeDisplay() {
+        sendJson(["type": "power_command", "action": "wake_display"])
+        sendMotionPacket(eventType: 0x07, dx: 0, dy: 0, isStrokeStart: true)
+    }
+
     public func lockScreen() {
         sendJson(["type": "power_command", "action": "lock_screen"])
     }
@@ -938,8 +952,29 @@ public final class MultipeerClient: NSObject, ObservableObject, @unchecked Senda
     }
 
     public func sendWakeOnLAN(targetMac: String? = nil, completion: ((Result<Void, Error>) -> Void)? = nil) {
-        let macToUse = targetMac ?? self.targetMacAddress
-        WakeOnLAN.wake(mac: macToUse, completion: completion)
+        // 1. Immediately send display-wake signal over active UDP + TCP in case Mac is in display-sleep (息屏)
+        wakeDisplay()
+
+        // 2. Also broadcast WoL magic packet bound to en0 (subnet broadcast + known Mac IPs)
+        let macToUse = (targetMac ?? self.targetMacAddress).trimmingCharacters(in: .whitespacesAndNewlines)
+        var ips = self.candidateHostIPs
+        if !self.hostIP.isEmpty && !ips.contains(self.hostIP) {
+            ips.insert(self.hostIP, at: 0)
+        }
+
+        if WakeOnLAN.parseMacAddress(macToUse) != nil {
+            WakeOnLAN.wake(mac: macToUse, targetIPs: ips) { result in
+                if self.isConnected {
+                    completion?(.success(()))
+                } else {
+                    completion?(result)
+                }
+            }
+        } else if isConnected {
+            completion?(.success(()))
+        } else {
+            completion?(.failure(WoLError.invalidMacAddress))
+        }
     }
 
     public func session(_ session: MCSession, didReceive stream: InputStream, withName streamName: String, fromPeer peerID: MCPeerID) {}
